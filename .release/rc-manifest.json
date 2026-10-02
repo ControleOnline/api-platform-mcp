@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "rc": 0,
+  "branch": "master",
+  "tasks": [1],
+  "repositories": {
+    "ControleOnline/api-platform-mcp": "initial"
+  },
+  "frozen": false
+}

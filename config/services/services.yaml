@@ -1,0 +1,11 @@
+services:
+    _defaults:
+        autowire: true
+        autoconfigure: true
+
+    ControleOnline\Service\McpServerService:
+        arguments:
+            $readOnly: true
+
+    ControleOnline\Controller\McpController:
+        tags: ['controller.service_arguments']

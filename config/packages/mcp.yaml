@@ -1,0 +1,6 @@
+# HTTP MCP server (read-only tools)
+# Path is fixed at /mcp by the controller route.
+mcp:
+    enabled: true
+    path: /mcp
+    read_only: true

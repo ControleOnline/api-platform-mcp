@@ -1,0 +1,6 @@
+# MCP tools/resources are registered via ControleOnline\Controller / Service.
+# When api-platform/mcp becomes compatible with core ^4, enable:
+# api_platform:
+#     mcp:
+#         enabled: true
+#         format: jsonld
