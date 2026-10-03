@@ -22,6 +22,8 @@ class McpServerService
 
     public function __construct(
         private readonly bool $readOnly = true,
+        private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
+        private readonly ?McpBusinessTools $businessTools = null,
     ) {
     }
 
@@ -81,7 +83,8 @@ class McpServerService
         } catch (\InvalidArgumentException $e) {
             return $this->error($id, -32601, $e->getMessage());
         } catch (\Throwable $e) {
-            return $this->error($id, -32603, 'Internal error: ' . $e->getMessage());
+            // Keep database, tenant and entity details out of MCP responses.
+            return $this->error($id, -32603, 'Internal server error');
         }
     }
 
@@ -113,6 +116,15 @@ class McpServerService
         return [
             'tools' => [
                 [
+                    'name' => 'list_my_companies',
+                    'description' => 'Lists only enabled companies the authenticated user can access. Use this to resolve the company before querying its data.',
+                    'inputSchema' => [
+                        'type' => 'object',
+                        'properties' => new \stdClass(),
+                        'additionalProperties' => false,
+                    ],
+                ],
+                [
                     'name' => 'health_check',
                     'description' => 'Returns API health and MCP server status (read-only).',
                     'inputSchema' => [
@@ -121,6 +133,7 @@ class McpServerService
                         'additionalProperties' => false,
                     ],
                 ],
+                ...McpBusinessTools::definitions(),
                 [
                     'name' => 'list_capabilities',
                     'description' => 'Lists current MCP capabilities and read-only policy.',
@@ -163,6 +176,9 @@ class McpServerService
                 'readOnly' => $this->readOnly,
                 'time' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format(\DateTimeInterface::ATOM),
             ],
+            'list_my_companies' => $this->listMyCompanies(),
+            'list_query_datasets', 'query_business_data' => $this->businessTools?->call((string) $name, $arguments)
+                ?? throw new \RuntimeException('Business data tools are not configured'),
             'list_capabilities' => $this->discovery(),
             default => throw new \InvalidArgumentException("Unknown tool: {$name}"),
         };
@@ -176,6 +192,16 @@ class McpServerService
             ],
             'isError' => false,
         ];
+    }
+
+    /** @return array{companies: list<array{id: int, name: string, alias: string}>} */
+    private function listMyCompanies(): array
+    {
+        if ($this->companyScopeProvider === null) {
+            throw new \RuntimeException('Company scope provider is not configured');
+        }
+
+        return ['companies' => $this->companyScopeProvider->listForCurrentUser()];
     }
 
     /**
