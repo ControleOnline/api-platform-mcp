@@ -1,6 +1,6 @@
 {
     "name": "controleonline/mcp",
-    "description": "Model Context Protocol (MCP) integration for ControleOnline API — read-only tools for AI agents",
+    "description": "Model Context Protocol (MCP) integration for ControleOnline API \u2014 read-only tools for AI agents",
     "license": "MIT",
     "autoload": {
         "psr-4": {
@@ -24,7 +24,7 @@
     ],
     "require": {
         "php": "^8.3|^8.4",
-        "controleonline/common": "1.0.4",
+        "controleonline/common": "1.0.5",
         "controleonline/people": "1.0.2"
     },
     "require-dev": {
