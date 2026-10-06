@@ -9,7 +9,7 @@ use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Attribute\Route;
-use Symfony\Component\Security\Http\Attribute\IsGranted;
+use Symfony\Component\Security\Core\Authorization\AuthorizationCheckerInterface;
 
 /**
  * Minimal HTTP MCP endpoint (Model Context Protocol).
@@ -22,6 +22,7 @@ class McpController
 {
     public function __construct(
         private readonly McpServerService $mcpServer,
+        private readonly AuthorizationCheckerInterface $authorizationChecker,
     ) {
     }
 
@@ -34,6 +35,16 @@ class McpController
     {
         if ($request->getMethod() === 'OPTIONS') {
             return new Response('', Response::HTTP_NO_CONTENT, $this->corsHeaders());
+        }
+
+        if (!$this->authorizationChecker->isGranted('ROLE_HUMAN')) {
+            return new JsonResponse(
+                ['error' => 'Authentication required'],
+                Response::HTTP_UNAUTHORIZED,
+                $this->corsHeaders() + [
+                    'WWW-Authenticate' => 'Bearer realm="ControleOnline MCP", resource_metadata="/.well-known/oauth-protected-resource"',
+                ]
+            );
         }
 
         if ($request->getMethod() === 'GET') {
