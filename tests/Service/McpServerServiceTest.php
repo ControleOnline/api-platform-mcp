@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ControleOnline\Mcp\Tests\Service;
 
 use ControleOnline\Service\McpServerService;
+use ControleOnline\Service\McpCompanyScopeProviderInterface;
 use PHPUnit\Framework\TestCase;
 
 final class McpServerServiceTest extends TestCase
@@ -26,7 +27,7 @@ final class McpServerServiceTest extends TestCase
 
     public function testInitialize(): void
     {
-        $response = $this->service->handle([
+        $response = (new McpServerService(true, null, new \ControleOnline\Service\McpBusinessTools()))->handle([
             'jsonrpc' => '2.0',
             'id' => 1,
             'method' => 'initialize',
@@ -47,6 +48,123 @@ final class McpServerServiceTest extends TestCase
         $names = array_column($response['result']['tools'], 'name');
         $this->assertContains('health_check', $names);
         $this->assertContains('list_capabilities', $names);
+        $this->assertContains('list_my_companies', $names);
+        $this->assertContains('list_query_datasets', $names);
+        $this->assertContains('query_business_data', $names);
+    }
+
+    public function testListMyCompaniesReturnsOnlyProviderProjection(): void
+    {
+        $scopeProvider = new class implements McpCompanyScopeProviderInterface {
+            public function listForCurrentUser(): array
+            {
+                return [['id' => 12, 'name' => 'Empresa A', 'alias' => 'empresa-a']];
+            }
+        };
+        $service = new McpServerService(true, $scopeProvider);
+
+        $response = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 6,
+            'method' => 'tools/call',
+            'params' => ['name' => 'list_my_companies', 'arguments' => []],
+        ]);
+
+        $this->assertArrayHasKey('result', $response);
+        $payload = json_decode($response['result']['content'][0]['text'], true);
+        $this->assertSame([
+            'companies' => [['id' => 12, 'name' => 'Empresa A', 'alias' => 'empresa-a']],
+        ], $payload);
+        $this->assertStringNotContainsString('document', strtolower($response['result']['content'][0]['text']));
+    }
+
+    public function testInternalErrorsDoNotExposeTenantOrDataDetails(): void
+    {
+        $scopeProvider = new class implements McpCompanyScopeProviderInterface {
+            public function listForCurrentUser(): array
+            {
+                throw new \RuntimeException('tenant-db-password-and-document');
+            }
+        };
+
+        $response = (new McpServerService(true, $scopeProvider))->handle([
+            'jsonrpc' => '2.0',
+            'id' => 7,
+            'method' => 'tools/call',
+            'params' => ['name' => 'list_my_companies', 'arguments' => []],
+        ]);
+
+        $this->assertSame('Internal server error', $response['error']['message']);
+        $this->assertStringNotContainsString('tenant-db-password-and-document', json_encode($response));
+    }
+
+    public function testBusinessQueryUsesOnlyValidatedFiltersAndSanitizedProviderRows(): void
+    {
+        $queryProvider = new class implements \ControleOnline\Service\McpReadQueryProviderInterface {
+            public array $received = [];
+
+            public function getDatasets(): array
+            {
+                return [['name' => 'sales', 'description' => 'Sales orders']];
+            }
+
+            public function query(string $dataset, array $filters): array
+            {
+                $this->received = [$dataset, $filters];
+
+                if ($filters['aggregate'] ?? false) {
+                    return [['count' => 10, 'total' => 2000.0]];
+                }
+
+                return [['id' => 4, 'date' => '2026-10-02T10:00:00-03:00', 'total' => 125.5, 'type' => 'sale']];
+            }
+        };
+        $service = new McpServerService(true, null, new \ControleOnline\Service\McpBusinessTools($queryProvider));
+
+        $response = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 8,
+            'method' => 'tools/call',
+            'params' => [
+                'name' => 'query_business_data',
+                'arguments' => ['dataset' => 'sales', 'from' => '2026-10-02', 'company_id' => 12, 'company_role' => 'customer', 'limit' => 25],
+            ],
+        ]);
+
+        $data = json_decode($response['result']['content'][0]['text'], true);
+        self::assertSame('sales', $queryProvider->received[0]);
+        self::assertSame(12, $queryProvider->received[1]['company_id']);
+        self::assertSame(25, $queryProvider->received[1]['limit']);
+        self::assertSame(125.5, $data['rows'][0]['total']);
+        self::assertArrayNotHasKey('document', $data['rows'][0]);
+
+        $summary = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 10,
+            'method' => 'tools/call',
+            'params' => [
+                'name' => 'query_business_data',
+                'arguments' => ['dataset' => 'sales', 'from' => '2026-10-02', 'to' => '2026-10-02', 'aggregate' => true],
+            ],
+        ]);
+        $summaryData = json_decode($summary['result']['content'][0]['text'], true);
+        self::assertSame(['count' => 10, 'total' => 2000], $summaryData['summary']);
+    }
+
+    public function testBusinessQueryRejectsUnboundedOrUnknownArguments(): void
+    {
+        $response = (new McpServerService(true, null, new \ControleOnline\Service\McpBusinessTools()))->handle([
+            'jsonrpc' => '2.0',
+            'id' => 9,
+            'method' => 'tools/call',
+            'params' => [
+                'name' => 'query_business_data',
+                'arguments' => ['dataset' => 'arbitrary', 'sql' => 'SELECT * FROM users'],
+            ],
+        ]);
+
+        self::assertSame(-32601, $response['error']['code']);
+        self::assertStringNotContainsString('SELECT', $response['error']['message']);
     }
 
     public function testToolsCallHealthCheck(): void
