@@ -149,6 +149,20 @@ final class McpServerServiceTest extends TestCase
         ]);
         $summaryData = json_decode($summary['result']['content'][0]['text'], true);
         self::assertSame(['count' => 10, 'total' => 2000], $summaryData['summary']);
+
+        $inventory = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 11,
+            'method' => 'tools/call',
+            'params' => [
+                'name' => 'query_business_data',
+                'arguments' => ['dataset' => 'inventory', 'company_id' => 12, 'limit' => 20],
+            ],
+        ]);
+        self::assertArrayHasKey('result', $inventory, json_encode($inventory) ?: 'missing result');
+        self::assertSame('inventory', $queryProvider->received[0]);
+        self::assertSame(12, $queryProvider->received[1]['company_id']);
+        self::assertSame(20, $queryProvider->received[1]['limit']);
     }
 
     public function testBusinessQueryRejectsUnboundedOrUnknownArguments(): void

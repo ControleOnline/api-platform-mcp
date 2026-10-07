@@ -26,7 +26,7 @@ final class McpBusinessTools
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
-                        'dataset' => ['type' => 'string', 'enum' => ['sales', 'invoices', 'products']],
+                        'dataset' => ['type' => 'string', 'enum' => ['sales', 'invoices', 'products', 'inventory']],
                         'from' => ['type' => 'string', 'description' => 'Optional inclusive start date (YYYY-MM-DD).'],
                         'to' => ['type' => 'string', 'description' => 'Optional inclusive end date (YYYY-MM-DD).'],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
@@ -65,7 +65,7 @@ final class McpBusinessTools
     private function queryBusinessData(array $arguments): array
     {
         $dataset = $arguments['dataset'] ?? null;
-        if (!is_string($dataset) || !in_array($dataset, ['sales', 'invoices', 'products'], true)) {
+        if (!is_string($dataset) || !in_array($dataset, ['sales', 'invoices', 'products', 'inventory'], true)) {
             throw new \InvalidArgumentException('Unsupported dataset');
         }
 
@@ -96,7 +96,8 @@ final class McpBusinessTools
         }
         if (($dataset === 'sales' && in_array($companyRole, ['payer', 'receiver'], true))
             || ($dataset === 'invoices' && in_array($companyRole, ['customer', 'supplier'], true))
-            || ($dataset === 'products' && ($companyRole !== null || isset($arguments['from']) || isset($arguments['to'])))) {
+            || (in_array($dataset, ['products', 'inventory'], true)
+                && ($companyRole !== null || isset($arguments['from']) || isset($arguments['to'])))) {
             throw new \InvalidArgumentException('These filters are not supported for this dataset');
         }
 
