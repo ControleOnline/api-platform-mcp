@@ -54,6 +54,31 @@ final class McpServerServiceTest extends TestCase
         $this->assertContains('query_business_data', $names);
     }
 
+    public function testWriteToolsRequireARegisteredProviderAndNonReadOnlyMode(): void
+    {
+        $writeProvider = new class implements \ControleOnline\Service\McpWriteOperationProviderInterface {
+            public function write(string $operation, array $arguments): array
+            {
+                return ['operation' => $operation, 'company_id' => $arguments['company_id']];
+            }
+        };
+        $tools = new \ControleOnline\Service\McpBusinessTools(null, $writeProvider);
+
+        $readOnlyService = new McpServerService(true, null, $tools);
+        $readOnlyNames = array_column($readOnlyService->handle([
+            'jsonrpc' => '2.0', 'id' => 1, 'method' => 'tools/list',
+        ])['result']['tools'], 'name');
+        $this->assertNotContains('write_business_data', $readOnlyNames);
+        $this->assertTrue($readOnlyService->discovery()['readOnly']);
+
+        $writableService = new McpServerService(false, null, $tools);
+        $writableNames = array_column($writableService->handle([
+            'jsonrpc' => '2.0', 'id' => 2, 'method' => 'tools/list',
+        ])['result']['tools'], 'name');
+        $this->assertContains('write_business_data', $writableNames);
+        $this->assertFalse($writableService->discovery()['readOnly']);
+    }
+
     public function testListMyCompaniesReturnsOnlyProviderProjection(): void
     {
         $scopeProvider = new class implements McpCompanyScopeProviderInterface {
@@ -265,10 +290,10 @@ final class McpServerServiceTest extends TestCase
             'jsonrpc' => '2.0',
             'id' => 4,
             'method' => 'tools/call',
-            'params' => ['name' => 'create_order', 'arguments' => []],
+            'params' => ['name' => 'write_business_data', 'arguments' => []],
         ]);
         $this->assertArrayHasKey('error', $response);
-        $this->assertStringContainsString('read-only', $response['error']['message']);
+        $this->assertStringContainsString('disabled', $response['error']['message']);
     }
 
     public function testUnknownMethod(): void
