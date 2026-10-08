@@ -7,6 +7,7 @@ namespace ControleOnline\Mcp\Tests\Service;
 use ControleOnline\Service\McpServerService;
 use ControleOnline\Service\McpCompanyScopeProviderInterface;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
 
 final class McpServerServiceTest extends TestCase
 {
@@ -87,7 +88,17 @@ final class McpServerServiceTest extends TestCase
             }
         };
 
-        $response = (new McpServerService(true, $scopeProvider))->handle([
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects(self::once())
+            ->method('error')
+            ->with('MCP request failed', self::callback(static function (array $context): bool {
+                self::assertSame('tools/call', $context['method']);
+                self::assertSame('list_my_companies', $context['tool']);
+                self::assertSame(\RuntimeException::class, $context['exception_class']);
+                self::assertArrayNotHasKey('exception_message', $context);
+                return true;
+            }));
+        $response = (new McpServerService(true, $scopeProvider, null, $logger))->handle([
             'jsonrpc' => '2.0',
             'id' => 7,
             'method' => 'tools/call',
@@ -177,6 +188,33 @@ final class McpServerServiceTest extends TestCase
         self::assertSame('wallets', $queryProvider->received[0]);
         self::assertSame(12, $queryProvider->received[1]['company_id']);
         self::assertSame(20, $queryProvider->received[1]['limit']);
+
+        $orders = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 13,
+            'method' => 'tools/call',
+            'params' => [
+                'name' => 'query_business_data',
+                'arguments' => ['dataset' => 'orders', 'from' => '2026-10-02', 'to' => '2026-10-02', 'company_id' => 12],
+            ],
+        ]);
+        self::assertArrayHasKey('result', $orders, json_encode($orders) ?: 'missing result');
+        self::assertSame('orders', $queryProvider->received[0]);
+        self::assertSame(12, $queryProvider->received[1]['company_id']);
+
+        foreach (['employees', 'clients', 'suppliers', 'salespeople', 'commissions'] as $index => $dataset) {
+            $response = $service->handle([
+                'jsonrpc' => '2.0',
+                'id' => 20 + $index,
+                'method' => 'tools/call',
+                'params' => [
+                    'name' => 'query_business_data',
+                    'arguments' => ['dataset' => $dataset, 'company_id' => 12],
+                ],
+            ]);
+            self::assertArrayHasKey('result', $response, json_encode($response) ?: 'missing result');
+            self::assertSame($dataset, $queryProvider->received[0]);
+        }
     }
 
     public function testBusinessQueryRejectsUnboundedOrUnknownArguments(): void
