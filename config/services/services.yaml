@@ -19,5 +19,9 @@ services:
         autowire: true
         autoconfigure: true
 
+    ControleOnline\EventSubscriber\McpTenantDomainSubscriber:
+        autowire: true
+        autoconfigure: true
+
     ControleOnline\Controller\McpController:
         tags: ['controller.service_arguments']
