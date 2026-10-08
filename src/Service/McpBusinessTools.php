@@ -6,6 +6,12 @@ namespace ControleOnline\Service;
 
 final class McpBusinessTools
 {
+    private const DATASETS = [
+        'sales', 'orders', 'invoices', 'products', 'inventory', 'wallets',
+        'employees', 'clients', 'suppliers', 'salespeople', 'commissions',
+        'configs', 'devices', 'displays', 'production_queue',
+    ];
+
     public function __construct(
         private readonly ?McpReadQueryProviderInterface $provider = null,
     ) {
@@ -22,11 +28,11 @@ final class McpBusinessTools
             ],
             [
                 'name' => 'query_business_data',
-                'description' => 'Use this tool to retrieve business data, not only metadata. First call list_my_companies to resolve the company, then query the chosen dataset with that company_id. Always set from and to for a time-based question. For "how much did I sell", query dataset=sales with aggregate=true. Use employees, clients, suppliers, and salespeople for linked people; use commissions for salesperson rates the user is authorized to manage. A request only returns data for companies this user can access in the current tenant.',
+                'description' => 'Use this tool to retrieve business data, not only metadata. First call list_my_companies to resolve the company, then query the chosen dataset with that company_id. Always set from and to for a time-based question. For "how much did I sell", query dataset=sales with aggregate=true. Use employees, clients, suppliers, and salespeople for linked people; use commissions for salesperson rates the user is authorized to manage. Use configs and devices for device setup metadata, displays for production screens, and production_queue for preparation status. A request only returns data for companies this user can access in the current tenant.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
-                        'dataset' => ['type' => 'string', 'enum' => ['sales', 'orders', 'invoices', 'products', 'inventory', 'wallets', 'employees', 'clients', 'suppliers', 'salespeople', 'commissions']],
+                        'dataset' => ['type' => 'string', 'enum' => self::DATASETS],
                         'from' => ['type' => 'string', 'description' => 'Optional inclusive start date (YYYY-MM-DD).'],
                         'to' => ['type' => 'string', 'description' => 'Optional inclusive end date (YYYY-MM-DD).'],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
@@ -65,7 +71,7 @@ final class McpBusinessTools
     private function queryBusinessData(array $arguments): array
     {
         $dataset = $arguments['dataset'] ?? null;
-        if (!is_string($dataset) || !in_array($dataset, ['sales', 'orders', 'invoices', 'products', 'inventory', 'wallets', 'employees', 'clients', 'suppliers', 'salespeople', 'commissions'], true)) {
+        if (!is_string($dataset) || !in_array($dataset, self::DATASETS, true)) {
             throw new \InvalidArgumentException('Unsupported dataset');
         }
 
@@ -96,7 +102,7 @@ final class McpBusinessTools
         }
         if ((in_array($dataset, ['sales', 'orders'], true) && in_array($companyRole, ['payer', 'receiver'], true))
             || ($dataset === 'invoices' && in_array($companyRole, ['customer', 'supplier'], true))
-            || (in_array($dataset, ['products', 'inventory', 'wallets', 'employees', 'clients', 'suppliers', 'salespeople', 'commissions'], true)
+            || (in_array($dataset, ['products', 'inventory', 'wallets', 'employees', 'clients', 'suppliers', 'salespeople', 'commissions', 'configs', 'devices', 'displays'], true)
                 && ($companyRole !== null || isset($arguments['from']) || isset($arguments['to'])))) {
             throw new \InvalidArgumentException('These filters are not supported for this dataset');
         }
