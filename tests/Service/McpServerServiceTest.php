@@ -202,7 +202,7 @@ final class McpServerServiceTest extends TestCase
         self::assertSame('orders', $queryProvider->received[0]);
         self::assertSame(12, $queryProvider->received[1]['company_id']);
 
-        foreach (['employees', 'clients', 'suppliers', 'salespeople', 'commissions'] as $index => $dataset) {
+        foreach (['employees', 'clients', 'suppliers', 'salespeople', 'commissions', 'configs', 'devices', 'displays'] as $index => $dataset) {
             $response = $service->handle([
                 'jsonrpc' => '2.0',
                 'id' => 20 + $index,
@@ -215,6 +215,19 @@ final class McpServerServiceTest extends TestCase
             self::assertArrayHasKey('result', $response, json_encode($response) ?: 'missing result');
             self::assertSame($dataset, $queryProvider->received[0]);
         }
+
+        $productionQueue = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 30,
+            'method' => 'tools/call',
+            'params' => [
+                'name' => 'query_business_data',
+                'arguments' => ['dataset' => 'production_queue', 'from' => '2026-10-01', 'to' => '2026-10-02', 'company_id' => 12],
+            ],
+        ]);
+        self::assertArrayHasKey('result', $productionQueue, json_encode($productionQueue) ?: 'missing result');
+        self::assertSame('production_queue', $queryProvider->received[0]);
+        self::assertSame('2026-10-01', $queryProvider->received[1]['from']);
     }
 
     public function testBusinessQueryRejectsUnboundedOrUnknownArguments(): void
