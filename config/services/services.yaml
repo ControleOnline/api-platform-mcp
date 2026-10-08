@@ -5,7 +5,8 @@ services:
 
     ControleOnline\Service\McpServerService:
         arguments:
-            $readOnly: true
+            # A write provider must still be registered for mutation tools to be enabled.
+            $readOnly: false
 
     ControleOnline\Service\McpBusinessTools:
         autowire: true

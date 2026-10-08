@@ -43,7 +43,7 @@ class McpServerService
                 'tools' => new \stdClass(),
                 'resources' => new \stdClass(),
             ],
-            'readOnly' => $this->readOnly,
+            'readOnly' => $this->isReadOnly(),
             'endpoint' => '/mcp',
             'transport' => 'http',
         ];
@@ -115,7 +115,7 @@ class McpServerService
                 'name' => self::SERVER_NAME,
                 'version' => self::SERVER_VERSION,
             ],
-            'instructions' => $this->readOnly
+            'instructions' => $this->isReadOnly()
                 ? 'ControleOnline MCP server — read-only query tools only. Use tools/list then tools/call.'
                 : 'ControleOnline MCP server — query and explicitly authorized business write tools. Use tools/list then tools/call.',
         ];
@@ -146,7 +146,7 @@ class McpServerService
                         'additionalProperties' => false,
                     ],
                 ],
-                ...McpBusinessTools::definitions(!$this->readOnly && $this->businessTools?->canWrite()),
+                ...McpBusinessTools::definitions(!$this->isReadOnly()),
                 [
                     'name' => 'list_capabilities',
                     'description' => 'Lists current MCP capabilities and write policy.',
@@ -173,7 +173,7 @@ class McpServerService
             throw new \InvalidArgumentException('Tool name is required');
         }
 
-        if ($name === 'write_business_data' && ($this->readOnly || !$this->businessTools?->canWrite())) {
+        if ($name === 'write_business_data' && $this->isReadOnly()) {
             throw new \InvalidArgumentException('Write operations are disabled');
         }
 
@@ -182,7 +182,7 @@ class McpServerService
                 'status' => 'ok',
                 'server' => self::SERVER_NAME,
                 'version' => self::SERVER_VERSION,
-                'readOnly' => $this->readOnly,
+                'readOnly' => $this->isReadOnly(),
                 'time' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format(\DateTimeInterface::ATOM),
             ],
             'list_my_companies' => $this->listMyCompanies(),
@@ -228,6 +228,15 @@ class McpServerService
                 ],
             ],
         ];
+    }
+
+    /**
+     * A registered write provider is the explicit capability grant. The package
+     * defaults to read-only when no application-specific provider is available.
+     */
+    private function isReadOnly(): bool
+    {
+        return $this->readOnly || !$this->businessTools?->canWrite();
     }
 
     /**

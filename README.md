@@ -4,16 +4,17 @@
 
 Integração do [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) com a API ControleOnline.
 
-Expõe o endpoint HTTP `/mcp` para agentes de IA (LLMs) descobrirem e invocarem **apenas tools de consulta (read-only)** nesta entrega.
+Expõe o endpoint HTTP `/mcp` para agentes de IA (LLMs) consultarem dados e, quando a aplicação registra um provider de escrita autorizado, criarem operações de negócio limitadas.
 
 ## Escopo atual
 
 - Transporte HTTP em `/mcp`
 - Autenticação OAuth 2.1 com Authorization Code + PKCE; a pessoa autentica na tela ControleOnline (`MANAGER_APP`)
-- Consultas somente de leitura, limitadas ao tenant do token e às empresas acessíveis pelo usuário (`mycompanies`)
+- Consultas limitadas ao tenant do token e às empresas acessíveis pelo usuário (`mycompanies`)
 - `securityFilter` da API aplicado às consultas de pedidos, vendas e faturas; produtos e estoque filtrados explicitamente pelas empresas acessíveis
 - Projeções fixas sem documentos, descrições livres, dados de contato ou serialização genérica de entidades
-- Sem tools de mutação (POST/PUT/PATCH/DELETE)
+- Escritas disponíveis somente com provider explicitamente registrado pela aplicação; o pacote permanece somente para consulta sem esse provider
+- Movimentações de estoque feitas por pedidos de compra, venda e transferência; os triggers do banco atualizam os saldos
 
 ## Tools disponíveis
 
@@ -28,6 +29,7 @@ Expõe o endpoint HTTP `/mcp` para agentes de IA (LLMs) descobrirem e invocarem 
 - Projeções de pessoas retornam nome e vínculo, sem documentos, telefone, e-mail, endereço ou credenciais.
 - `query_business_data` com `aggregate: true`: total e quantidade de vendas encerradas no intervalo (sem truncar o agregado ao limite de linhas).
 - `health_check` e `list_capabilities`: estado e descoberta do servidor.
+- `write_business_data` (quando habilitada pela aplicação): configuração de devices, produtos e pedidos de compra, venda e transferência, sempre sob as regras e permissões da API.
 
 Datas de vendas e faturas usam o fuso `APP_TIMEZONE` da API. O escopo de empresas é recalculado no banco do tenant para cada solicitação; `app-domain`, `Origin` e `Referer` enviados pelo cliente não alteram o tenant de um token.
 
