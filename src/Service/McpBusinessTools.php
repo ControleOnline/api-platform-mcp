@@ -22,11 +22,11 @@ final class McpBusinessTools
             ],
             [
                 'name' => 'query_business_data',
-                'description' => 'Reads a bounded, sanitized collection from an approved business dataset. Results are limited to companies this user can access in the current tenant.',
+                'description' => 'Use this tool to retrieve business data, not only metadata. First call list_my_companies to resolve the company, then query the chosen dataset with that company_id. Always set from and to for a time-based question. For "how much did I sell", query dataset=sales with aggregate=true. Use employees, clients, suppliers, and salespeople for linked people; use commissions for salesperson rates the user is authorized to manage. A request only returns data for companies this user can access in the current tenant.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
-                        'dataset' => ['type' => 'string', 'enum' => ['sales', 'invoices', 'products', 'inventory', 'wallets']],
+                        'dataset' => ['type' => 'string', 'enum' => ['sales', 'orders', 'invoices', 'products', 'inventory', 'wallets', 'employees', 'clients', 'suppliers', 'salespeople', 'commissions']],
                         'from' => ['type' => 'string', 'description' => 'Optional inclusive start date (YYYY-MM-DD).'],
                         'to' => ['type' => 'string', 'description' => 'Optional inclusive end date (YYYY-MM-DD).'],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
@@ -65,7 +65,7 @@ final class McpBusinessTools
     private function queryBusinessData(array $arguments): array
     {
         $dataset = $arguments['dataset'] ?? null;
-        if (!is_string($dataset) || !in_array($dataset, ['sales', 'invoices', 'products', 'inventory', 'wallets'], true)) {
+        if (!is_string($dataset) || !in_array($dataset, ['sales', 'orders', 'invoices', 'products', 'inventory', 'wallets', 'employees', 'clients', 'suppliers', 'salespeople', 'commissions'], true)) {
             throw new \InvalidArgumentException('Unsupported dataset');
         }
 
@@ -94,9 +94,9 @@ final class McpBusinessTools
         if ($companyRole !== null && $companyId === null) {
             throw new \InvalidArgumentException('company_id is required when company_role is set');
         }
-        if (($dataset === 'sales' && in_array($companyRole, ['payer', 'receiver'], true))
+        if ((in_array($dataset, ['sales', 'orders'], true) && in_array($companyRole, ['payer', 'receiver'], true))
             || ($dataset === 'invoices' && in_array($companyRole, ['customer', 'supplier'], true))
-            || (in_array($dataset, ['products', 'inventory', 'wallets'], true)
+            || (in_array($dataset, ['products', 'inventory', 'wallets', 'employees', 'clients', 'suppliers', 'salespeople', 'commissions'], true)
                 && ($companyRole !== null || isset($arguments['from']) || isset($arguments['to'])))) {
             throw new \InvalidArgumentException('These filters are not supported for this dataset');
         }
@@ -120,9 +120,16 @@ final class McpBusinessTools
             'limit' => $limit,
         ]);
 
-        return $aggregate
-            ? ['dataset' => $dataset, 'summary' => $rows[0] ?? ['count' => 0, 'total' => 0]]
-            : ['dataset' => $dataset, 'count' => count($rows), 'rows' => $rows];
+        if ($aggregate) {
+            $summary = $rows[0] ?? ['count' => 0, 'total' => 0];
+            return ['dataset' => $dataset, 'summary' => $summary] + ((int) $summary['count'] === 0
+                ? ['hint' => 'No rows matched. Confirm the date range and choose an accessible company from list_my_companies.']
+                : []);
+        }
+
+        return ['dataset' => $dataset, 'count' => count($rows), 'rows' => $rows] + ($rows === []
+            ? ['hint' => 'No rows matched. Confirm the date range and choose an accessible company from list_my_companies.']
+            : []);
     }
 
     private function provider(): McpReadQueryProviderInterface

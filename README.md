@@ -11,15 +11,19 @@ Expõe o endpoint HTTP `/mcp` para agentes de IA (LLMs) descobrirem e invocarem 
 - Transporte HTTP em `/mcp`
 - Autenticação OAuth 2.1 com Authorization Code + PKCE; a pessoa autentica na tela ControleOnline (`MANAGER_APP`)
 - Consultas somente de leitura, limitadas ao tenant do token e às empresas acessíveis pelo usuário (`mycompanies`)
-- `securityFilter` da API aplicado às consultas de vendas e faturas; produtos filtrados explicitamente pelas empresas acessíveis
+- `securityFilter` da API aplicado às consultas de pedidos, vendas e faturas; produtos e estoque filtrados explicitamente pelas empresas acessíveis
 - Projeções fixas sem documentos, descrições livres, dados de contato ou serialização genérica de entidades
 - Sem tools de mutação (POST/PUT/PATCH/DELETE)
 
 ## Tools disponíveis
 
 - `list_my_companies`: empresas habilitadas que o usuário pode acessar.
-- `list_query_datasets`: áreas de dados habilitadas: `sales`, `invoices` e `products`.
-- `query_business_data`: consulta com intervalo opcional de datas, empresa e limite de até 100 linhas.
+- `list_query_datasets`: áreas de dados habilitadas: `sales`, `orders`, `invoices`, `products`, `inventory`, `wallets`, `employees`, `clients`, `suppliers`, `salespeople` e `commissions`.
+- `query_business_data`: consulta com intervalo opcional de datas, empresa e limite de até 100 linhas. Para perguntas por período, informe `from` e `to`; use `list_my_companies` antes para resolver `company_id`.
+- `dataset=orders` consulta pedidos de todos os tipos; `dataset=sales` consulta somente vendas encerradas.
+- Pedidos e faturas usam somente empresas acessíveis ao usuário: cliente/fornecedor nos pedidos e pagador/recebedor nas faturas.
+- Pessoas e comissões são lidas por vínculos ativos com essas empresas; comissões só são incluídas quando `PeopleLinkService` autoriza o usuário a gerenciar a empresa do vendedor.
+- Projeções de pessoas retornam nome e vínculo, sem documentos, telefone, e-mail, endereço ou credenciais.
 - `query_business_data` com `aggregate: true`: total e quantidade de vendas encerradas no intervalo (sem truncar o agregado ao limite de linhas).
 - `health_check` e `list_capabilities`: estado e descoberta do servidor.
 
