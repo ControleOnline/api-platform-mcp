@@ -10,7 +10,7 @@ The MCP server is a protected resource at `/mcp`. OAuth endpoints and the consen
 4. The user signs in and approves or denies the requested `mcp:read` scope. The callback host and data scope are shown on the consent screen.
 5. The API returns a short-lived, single-use code. Code exchange creates a 15-minute Bearer token with user and tenant claims.
 
-The API resolves the tenant from the signed authorization code before the multi-tenancy database switch. For `/mcp`, it resolves the tenant from the signed access token before the switch and ignores caller-supplied `app-domain`, `Origin`, and `Referer`. Missing and invalid credentials stop request propagation before a tenant database can be selected. OPTIONS preflight remains unauthenticated and does not select a tenant database.
+The API resolves the tenant from the signed authorization code before the multi-tenancy database switch. For `/mcp`, a domain in `/mcp/{domain}` selects the tenant; bare `/mcp` uses the API host's main domain. This runs before the database listener and ignores caller-supplied `app-domain`, `Origin`, and `Referer`. Missing and invalid credentials stop request propagation before a tenant database can be selected. OPTIONS preflight remains unauthenticated and does not select a tenant database.
 
 ## Data boundaries
 
@@ -29,3 +29,10 @@ php -d error_reporting=1 bin/console lint:container --env=test
 ```
 
 For multiple API nodes, configure `cache.app` and `lock.factory` to use shared backends so authorization-code replay prevention is consistent across nodes.
+# MCP tenant selection
+
+The MCP module selects the tenant from `/mcp/{domain}` before the multi-tenancy
+request listener switches databases. Bare `/mcp` uses the API host's main domain.
+The URL value overrides `app-domain`, `Origin`, and `Referer`, so a client cannot
+switch the MCP request to an unrelated tenant by supplying headers. The subscriber
+runs before routing because database selection happens earlier than route matching.
