@@ -1,6 +1,6 @@
 {
     "name": "controleonline/mcp",
-    "description": "Model Context Protocol (MCP) integration for ControleOnline API \u2014 read-only tools for AI agents",
+    "description": "Model Context Protocol (MCP) integration for ControleOnline API with scoped query and optional authorized write tools",
     "license": "MIT",
     "autoload": {
         "psr-4": {
