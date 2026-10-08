@@ -18,9 +18,11 @@ Expõe o endpoint HTTP `/mcp` para agentes de IA (LLMs) descobrirem e invocarem 
 ## Tools disponíveis
 
 - `list_my_companies`: empresas habilitadas que o usuário pode acessar.
-- `list_query_datasets`: áreas de dados habilitadas: `sales`, `orders`, `invoices`, `products`, `inventory`, `wallets`, `employees`, `clients`, `suppliers`, `salespeople` e `commissions`.
+- `list_query_datasets`: áreas de dados habilitadas: `sales`, `orders`, `invoices`, `products`, `inventory`, `wallets`, `employees`, `clients`, `suppliers`, `salespeople`, `commissions`, `configs`, `devices`, `displays` e `production_queue`.
 - `query_business_data`: consulta com intervalo opcional de datas, empresa e limite de até 100 linhas. Para perguntas por período, informe `from` e `to`; use `list_my_companies` antes para resolver `company_id`.
 - `dataset=orders` consulta pedidos de todos os tipos; `dataset=sales` consulta somente vendas encerradas.
+- `configs` consulta somente metadados da configuração `devices`; valores de configuração e segredos não são retornados. `devices` lista aliases e tipos configurados para as empresas acessíveis.
+- `displays` lista displays e filas vinculadas às empresas acessíveis; `production_queue` retorna itens de preparação de pedidos de venda e seu status operacional.
 - Pedidos e faturas usam somente empresas acessíveis ao usuário: cliente/fornecedor nos pedidos e pagador/recebedor nas faturas.
 - Pessoas e comissões são lidas por vínculos ativos com essas empresas; comissões só são incluídas quando `PeopleLinkService` autoriza o usuário a gerenciar a empresa do vendedor.
 - Projeções de pessoas retornam nome e vínculo, sem documentos, telefone, e-mail, endereço ou credenciais.
