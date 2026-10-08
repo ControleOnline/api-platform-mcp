@@ -59,7 +59,7 @@ final class McpBusinessTools
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
-                        'operation' => ['type' => 'string', 'enum' => ['upsert_company_config', 'create_product', 'update_product', 'create_purchase_order', 'create_stock_movement']],
+                        'operation' => ['type' => 'string', 'enum' => ['upsert_company_config', 'create_product', 'update_product', 'create_stock_order']],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
                         'record_id' => ['type' => 'integer', 'minimum' => 1],
                         'payload' => ['type' => 'object'],
@@ -94,7 +94,7 @@ final class McpBusinessTools
         $operation = $arguments['operation'] ?? null;
         $companyId = $arguments['company_id'] ?? null;
         $payload = $arguments['payload'] ?? null;
-        if (!is_string($operation) || !in_array($operation, ['upsert_company_config', 'create_product', 'update_product', 'create_purchase_order', 'create_stock_movement'], true)) {
+        if (!is_string($operation) || !in_array($operation, ['upsert_company_config', 'create_product', 'update_product', 'create_stock_order'], true)) {
             throw new \InvalidArgumentException('Unsupported write operation');
         }
         if (!is_int($companyId) || $companyId < 1 || !is_array($payload)) {
