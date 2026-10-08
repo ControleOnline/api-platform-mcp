@@ -34,7 +34,7 @@ final class McpBusinessTools
             ],
             [
                 'name' => 'query_business_data',
-                'description' => 'Use this tool to retrieve business data, not only metadata. First call list_my_companies to resolve the company, then query the chosen dataset with that company_id. Always set from and to for a time-based question. For "how much did I sell", query dataset=sales with aggregate=true. Use employees, clients, suppliers, and salespeople for linked people; use commissions for salesperson rates the user is authorized to manage. Use configs and devices for device setup metadata, displays for production screens, and production_queue for preparation status. A request only returns data for companies this user can access in the current tenant.',
+                'description' => 'Use this tool to retrieve business data, not only metadata. First call list_my_companies to resolve the company, then query the chosen dataset with that company_id. Always set from and to for a time-based question. Set aggregate=true to get database-computed counts and sums without loading detail rows; optionally pass group_by to split the result by an allowed dimension. Use employees, clients, suppliers, and salespeople for linked people; use commissions for salesperson rates the user is authorized to manage. Use configs and devices for device setup metadata, displays for production screens, and production_queue for preparation status. A request only returns data for companies this user can access in the current tenant.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
@@ -43,7 +43,14 @@ final class McpBusinessTools
                         'to' => ['type' => 'string', 'description' => 'Optional inclusive end date (YYYY-MM-DD).'],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
                         'company_role' => ['type' => 'string', 'enum' => ['customer', 'supplier', 'payer', 'receiver']],
-                        'aggregate' => ['type' => 'boolean', 'description' => 'Return the count and total of closed sales instead of individual rows.'],
+                        'aggregate' => ['type' => 'boolean', 'description' => 'Return database-computed counts and applicable sums instead of individual rows.'],
+                        'group_by' => [
+                            'type' => 'array',
+                            'description' => 'Optional grouping for aggregate results. Supported dimensions depend on the dataset: day, month, type, company_id, product, wallet, active, status, or queue.',
+                            'items' => ['type' => 'string', 'enum' => ['day', 'month', 'type', 'company_id', 'product', 'wallet', 'active', 'status', 'queue']],
+                            'uniqueItems' => true,
+                            'maxItems' => 3,
+                        ],
                         'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100],
                     ],
                     'required' => ['dataset'],
@@ -194,8 +201,37 @@ final class McpBusinessTools
         }
 
         $aggregate = $arguments['aggregate'] ?? false;
-        if (!is_bool($aggregate) || ($aggregate && $dataset !== 'sales')) {
-            throw new \InvalidArgumentException('Aggregate summaries are available only for sales');
+        if (!is_bool($aggregate)) {
+            throw new \InvalidArgumentException('aggregate must be a boolean');
+        }
+        $groupBy = $arguments['group_by'] ?? [];
+        if (!is_array($groupBy) || array_filter($groupBy, static fn (mixed $dimension): bool => !is_string($dimension)) !== []) {
+            throw new \InvalidArgumentException('group_by must be a list of dimensions');
+        }
+        $groupBy = array_values(array_unique($groupBy));
+        $aggregatable = [
+            'sales', 'orders', 'invoices', 'products', 'inventory', 'wallets',
+            'employees', 'clients', 'suppliers', 'salespeople', 'configs', 'devices', 'displays', 'production_queue',
+        ];
+        if ($aggregate && !in_array($dataset, $aggregatable, true)) {
+            throw new \InvalidArgumentException('Aggregate summaries are not available for this dataset');
+        }
+        $groupable = match ($dataset) {
+            'sales', 'orders', 'invoices' => ['day', 'month', 'type', 'company_id'],
+            'products' => ['type', 'active', 'company_id'],
+            'inventory' => ['product', 'company_id'],
+            'wallets' => ['wallet', 'company_id'],
+            'employees', 'clients', 'suppliers', 'salespeople', 'commissions' => ['company_id'],
+            'configs' => ['company_id'],
+            'devices', 'displays' => ['company_id', 'type'],
+            'production_queue' => ['day', 'company_id', 'status', 'queue'],
+            default => [],
+        };
+        if (count($groupBy) > 3 || array_diff($groupBy, $groupable) !== []) {
+            throw new \InvalidArgumentException('Unsupported grouping dimension for this dataset');
+        }
+        if ($groupBy !== [] && !$aggregate) {
+            throw new \InvalidArgumentException('group_by requires aggregate=true');
         }
 
         $limit = $arguments['limit'] ?? 50;
@@ -209,11 +245,16 @@ final class McpBusinessTools
             'company_id' => $companyId,
             'company_role' => $companyRole,
             'aggregate' => $aggregate,
+            'group_by' => $groupBy,
             'limit' => $limit,
         ]);
 
         if ($aggregate) {
-            $summary = $rows[0] ?? ['count' => 0, 'total' => 0];
+            if ($groupBy !== []) {
+                return ['dataset' => $dataset, 'groups' => $rows, 'group_by' => $groupBy]
+                    + ($rows === [] ? ['hint' => 'No rows matched. Confirm the date range and choose an accessible company from list_my_companies.'] : []);
+            }
+            $summary = $rows[0] ?? ['count' => 0];
             return ['dataset' => $dataset, 'summary' => $summary] + ((int) $summary['count'] === 0
                 ? ['hint' => 'No rows matched. Confirm the date range and choose an accessible company from list_my_companies.']
                 : []);
