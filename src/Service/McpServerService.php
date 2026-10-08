@@ -7,12 +7,12 @@ namespace ControleOnline\Service;
 use Psr\Log\LoggerInterface;
 
 /**
- * Minimal MCP JSON-RPC server (read-only tools).
+ * Minimal MCP JSON-RPC server with scoped query and optional mutation tools.
  *
  * Supported methods:
  * - initialize
  * - tools/list
- * - tools/call (only tools marked read-only)
+ * - tools/call (query tools and explicitly registered write operations)
  * - resources/list
  * - ping
  */
@@ -115,7 +115,9 @@ class McpServerService
                 'name' => self::SERVER_NAME,
                 'version' => self::SERVER_VERSION,
             ],
-            'instructions' => 'ControleOnline MCP server — read-only query tools only. Use tools/list then tools/call.',
+            'instructions' => $this->readOnly
+                ? 'ControleOnline MCP server — read-only query tools only. Use tools/list then tools/call.'
+                : 'ControleOnline MCP server — query and explicitly authorized business write tools. Use tools/list then tools/call.',
         ];
     }
 
@@ -144,10 +146,10 @@ class McpServerService
                         'additionalProperties' => false,
                     ],
                 ],
-                ...McpBusinessTools::definitions(),
+                ...McpBusinessTools::definitions(!$this->readOnly && $this->businessTools?->canWrite()),
                 [
                     'name' => 'list_capabilities',
-                    'description' => 'Lists current MCP capabilities and read-only policy.',
+                    'description' => 'Lists current MCP capabilities and write policy.',
                     'inputSchema' => [
                         'type' => 'object',
                         'properties' => new \stdClass(),
@@ -171,12 +173,8 @@ class McpServerService
             throw new \InvalidArgumentException('Tool name is required');
         }
 
-        // Hard guard: no mutation tools in this delivery
-        $mutationPrefixes = ['create_', 'update_', 'delete_', 'write_', 'set_', 'post_', 'put_', 'patch_'];
-        foreach ($mutationPrefixes as $prefix) {
-            if (str_starts_with((string) $name, $prefix)) {
-                throw new \InvalidArgumentException('Mutation tools are disabled (read-only MCP)');
-            }
+        if ($name === 'write_business_data' && ($this->readOnly || !$this->businessTools?->canWrite())) {
+            throw new \InvalidArgumentException('Write operations are disabled');
         }
 
         $content = match ($name) {
