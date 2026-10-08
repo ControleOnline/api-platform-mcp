@@ -7,6 +7,10 @@ services:
         arguments:
             $readOnly: true
 
+    ControleOnline\Service\McpBusinessTools:
+        autowire: true
+        autoconfigure: true
+
     ControleOnline\Service\McpCompanyScopeProviderInterface:
         alias: ControleOnline\Service\PeopleRoleCompanyScopeProvider
 
