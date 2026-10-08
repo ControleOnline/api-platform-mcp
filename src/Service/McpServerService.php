@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ControleOnline\Service;
 
+use Psr\Log\LoggerInterface;
+
 /**
  * Minimal MCP JSON-RPC server (read-only tools).
  *
@@ -24,6 +26,7 @@ class McpServerService
         private readonly bool $readOnly = true,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
         private readonly ?McpBusinessTools $businessTools = null,
+        private readonly ?LoggerInterface $logger = null,
     ) {
     }
 
@@ -84,6 +87,14 @@ class McpServerService
             return $this->error($id, -32601, $e->getMessage());
         } catch (\Throwable $e) {
             // Keep database, tenant and entity details out of MCP responses.
+            $arguments = is_array($params['arguments'] ?? null) ? $params['arguments'] : [];
+            $this->logger?->error('MCP request failed', [
+                'method' => is_string($method) ? $method : null,
+                'tool' => is_string($params['name'] ?? null) ? $params['name'] : null,
+                'dataset' => is_string($arguments['dataset'] ?? null) ? $arguments['dataset'] : null,
+                'exception_class' => $e::class,
+                'exception_code' => $e->getCode(),
+            ]);
             return $this->error($id, -32603, 'Internal server error');
         }
     }
