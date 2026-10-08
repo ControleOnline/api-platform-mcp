@@ -55,14 +55,49 @@ final class McpBusinessTools
         if ($includeWrites) {
             $definitions[] = [
                 'name' => 'write_business_data',
-                'description' => 'Create or update an allowed business record for a company the authenticated user is authorized to manage. The API applies its normal security and business rules.',
+                'description' => 'Create or update company device configuration, products, or purchase, sale, and transfer orders for a company the authenticated user is authorized to manage. Database stock triggers process order changes. The API applies its normal security and business rules.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
                         'operation' => ['type' => 'string', 'enum' => ['upsert_company_config', 'create_product', 'update_product', 'create_stock_order']],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
                         'record_id' => ['type' => 'integer', 'minimum' => 1],
-                        'payload' => ['type' => 'object'],
+                        'payload' => [
+                            'type' => 'object',
+                            'description' => 'For upsert_company_config: config_key=devices and config_value object. For create_product/update_product: only product, sku, type, price, productCondition, description, active and productUnitId. For create_stock_order: order_type (purchase/sale/transfer), partner_id for purchase/sale, destination_company_id for transfer, and items with product_id, positive quantity and, for transfer, in_inventory_id/out_inventory_id.',
+                            'properties' => [
+                                'config_key' => ['type' => 'string', 'enum' => ['devices']],
+                                'config_value' => ['type' => 'object'],
+                                'product' => ['type' => 'string'],
+                                'sku' => ['type' => 'string'],
+                                'type' => ['type' => 'string'],
+                                'price' => ['type' => 'number', 'minimum' => 0],
+                                'productCondition' => ['type' => 'string'],
+                                'description' => ['type' => 'string'],
+                                'active' => ['type' => 'boolean'],
+                                'productUnitId' => ['type' => 'integer', 'minimum' => 1],
+                                'order_type' => ['type' => 'string', 'enum' => ['purchase', 'sale', 'transfer']],
+                                'partner_id' => ['type' => 'integer', 'minimum' => 1],
+                                'destination_company_id' => ['type' => 'integer', 'minimum' => 1],
+                                'items' => [
+                                    'type' => 'array',
+                                    'minItems' => 1,
+                                    'items' => [
+                                        'type' => 'object',
+                                        'properties' => [
+                                            'product_id' => ['type' => 'integer', 'minimum' => 1],
+                                            'quantity' => ['type' => 'number', 'exclusiveMinimum' => 0],
+                                            'comment' => ['type' => 'string'],
+                                            'in_inventory_id' => ['type' => 'integer', 'minimum' => 1],
+                                            'out_inventory_id' => ['type' => 'integer', 'minimum' => 1],
+                                        ],
+                                        'required' => ['product_id', 'quantity'],
+                                        'additionalProperties' => false,
+                                    ],
+                                ],
+                            ],
+                            'additionalProperties' => false,
+                        ],
                     ],
                     'required' => ['operation', 'company_id', 'payload'],
                     'additionalProperties' => false,
