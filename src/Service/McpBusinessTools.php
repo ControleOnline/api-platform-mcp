@@ -14,16 +14,22 @@ final class McpBusinessTools
 
     public function __construct(
         private readonly ?McpReadQueryProviderInterface $provider = null,
+        private readonly ?McpWriteOperationProviderInterface $writeProvider = null,
     ) {
     }
 
-    /** @return list<array<string, mixed>> */
-    public static function definitions(): array
+    public function canWrite(): bool
     {
-        return [
+        return $this->writeProvider !== null;
+    }
+
+    /** @return list<array<string, mixed>> */
+    public static function definitions(bool $includeWrites = false): array
+    {
+        $definitions = [
             [
                 'name' => 'list_query_datasets',
-                'description' => 'Lists read-only business data areas available to this authenticated user.',
+                'description' => 'Lists business data areas available to this authenticated user.',
                 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass(), 'additionalProperties' => false],
             ],
             [
@@ -45,6 +51,26 @@ final class McpBusinessTools
                 ],
             ],
         ];
+
+        if ($includeWrites) {
+            $definitions[] = [
+                'name' => 'write_business_data',
+                'description' => 'Create or update an allowed business record for a company the authenticated user is authorized to manage. The API applies its normal security and business rules.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'operation' => ['type' => 'string', 'enum' => ['upsert_company_config', 'create_product', 'update_product', 'create_purchase_order', 'create_stock_movement']],
+                        'company_id' => ['type' => 'integer', 'minimum' => 1],
+                        'record_id' => ['type' => 'integer', 'minimum' => 1],
+                        'payload' => ['type' => 'object'],
+                    ],
+                    'required' => ['operation', 'company_id', 'payload'],
+                    'additionalProperties' => false,
+                ],
+            ];
+        }
+
+        return $definitions;
     }
 
     /** @param array<string, mixed> $arguments
@@ -55,8 +81,33 @@ final class McpBusinessTools
         return match ($name) {
             'list_query_datasets' => $this->listDatasets(),
             'query_business_data' => $this->queryBusinessData($arguments),
+            'write_business_data' => $this->writeBusinessData($arguments),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
+    }
+
+    /** @param array<string, mixed> $arguments
+     *  @return array<string, mixed>
+     */
+    private function writeBusinessData(array $arguments): array
+    {
+        $operation = $arguments['operation'] ?? null;
+        $companyId = $arguments['company_id'] ?? null;
+        $payload = $arguments['payload'] ?? null;
+        if (!is_string($operation) || !in_array($operation, ['upsert_company_config', 'create_product', 'update_product', 'create_purchase_order', 'create_stock_movement'], true)) {
+            throw new \InvalidArgumentException('Unsupported write operation');
+        }
+        if (!is_int($companyId) || $companyId < 1 || !is_array($payload)) {
+            throw new \InvalidArgumentException('company_id and payload are required');
+        }
+        if ($operation === 'update_product' && (!is_int($arguments['record_id'] ?? null) || $arguments['record_id'] < 1)) {
+            throw new \InvalidArgumentException('record_id is required for update_product');
+        }
+        if ($this->writeProvider === null) {
+            throw new \RuntimeException('Write operations are not configured');
+        }
+
+        return $this->writeProvider->write($operation, $arguments);
     }
 
     /** @return array{datasets: list<array{name: string, description: string}>} */
