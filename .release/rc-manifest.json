@@ -1,13 +1,13 @@
 {
-  "version": "1.0.6",
+  "version": "1.0.7",
   "rc": 1,
-  "branch": "rc/1.0.6-rc.1",
+  "branch": "rc/1.0.7-rc.1",
   "tasks": [
     197
   ],
-  "baseMaster": "85953ebbc63f800a4ad36c63454d97934ffe972e",
+  "baseMaster": "649e647b65d24ec8b384ff706bee44d90294f31a",
   "repositories": {
-    "ControleOnline/api-platform-mcp": "ecac6e1b788721396ad0220561e314a00bbb3086"
+    "ControleOnline/api-platform-mcp": "95068782207351fb2212677ee18033349f56daaf"
   },
   "frozen": true
 }
