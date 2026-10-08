@@ -25,7 +25,8 @@
     "require": {
         "php": "^8.3|^8.4",
         "controleonline/common": "1.0.5",
-        "controleonline/people": "1.0.2"
+        "controleonline/people": "1.0.2",
+        "psr/log": "3.0.2"
     },
     "require-dev": {
         "phpunit/phpunit": "^12.1"
