@@ -5,7 +5,7 @@
   "baseMaster": "049fcc6f44b2ae09173015e074fd543b0eb23e8e",
   "tasks": [1075],
   "repositories": {
-    "ControleOnline/api-platform-mcp": "049fcc6f44b2ae09173015e074fd543b0eb23e8e"
+    "ControleOnline/api-platform-mcp": "f70c354df3ba59ab291e435630df5e81d9c9d4f6"
   },
   "frozen": true
 }
