@@ -34,7 +34,7 @@ final class McpBusinessTools
             ],
             [
                 'name' => 'query_business_data',
-                'description' => 'Use this tool to retrieve business data, not only metadata. First call list_my_companies to resolve the company, then query the chosen dataset with that company_id. Always set from and to for a time-based question. Set aggregate=true to get database-computed counts and sums without loading detail rows; optionally pass group_by to split the result by an allowed dimension. Use employees, clients, suppliers, and salespeople for linked people; use commissions for salesperson rates the user is authorized to manage. Use configs and devices for device setup metadata, displays for production screens, and production_queue for preparation status. A request only returns data for companies this user can access in the current tenant.',
+                'description' => 'Retrieve complete business records and relationships allowed for the authenticated user. Orders, sales, and invoices include linked counterparties and their details; linked people are returned only when authorized through an in-scope order/invoice or an enabled people_link. Use record_id to retrieve a specific order (for example an order number) while the API still applies securityFilter and company scope. Use limit and offset to page through all rows until has_more is false. Set from/to for time-based questions. Set aggregate=true for database-computed summaries. Every query is restricted to companies this user can access in the current tenant; API keys, passwords, credentials, tokens, and charge capabilities are removed.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
@@ -43,6 +43,7 @@ final class McpBusinessTools
                         'to' => ['type' => 'string', 'description' => 'Optional inclusive end date (YYYY-MM-DD).'],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
                         'company_role' => ['type' => 'string', 'enum' => ['customer', 'supplier', 'payer', 'receiver']],
+                        'record_id' => ['type' => 'integer', 'minimum' => 1, 'description' => 'Exact record ID filter, especially useful for looking up a specific order or invoice. It never bypasses company or security filters.'],
                         'aggregate' => ['type' => 'boolean', 'description' => 'Return database-computed counts and applicable sums instead of individual rows.'],
                         'group_by' => [
                             'type' => 'array',
@@ -52,6 +53,7 @@ final class McpBusinessTools
                             'maxItems' => 3,
                         ],
                         'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100],
+                        'offset' => ['type' => 'integer', 'minimum' => 0, 'description' => 'Pagination offset. Continue increasing it by limit while has_more is true.'],
                     ],
                     'required' => ['dataset'],
                     'additionalProperties' => false,
@@ -139,6 +141,7 @@ final class McpBusinessTools
         if (!is_string($operation) || !in_array($operation, ['upsert_company_config', 'create_product', 'update_product', 'create_stock_order'], true)) {
             throw new \InvalidArgumentException('Unsupported write operation');
         }
+
         if (!is_int($companyId) || $companyId < 1 || !is_array($payload)) {
             throw new \InvalidArgumentException('company_id and payload are required');
         }
@@ -184,6 +187,14 @@ final class McpBusinessTools
         $companyId = $arguments['company_id'] ?? null;
         if ($companyId !== null && (!is_int($companyId) || $companyId < 1)) {
             throw new \InvalidArgumentException('company_id must be a positive integer');
+        }
+
+        $recordId = $arguments['record_id'] ?? null;
+        if ($recordId !== null && (!is_int($recordId) || $recordId < 1)) {
+            throw new \InvalidArgumentException('record_id must be a positive integer');
+        }
+        if ($recordId !== null && !in_array($dataset, ['sales', 'orders', 'invoices', 'products'], true)) {
+            throw new \InvalidArgumentException('record_id is not supported for this dataset');
         }
 
         $companyRole = $arguments['company_role'] ?? null;
@@ -238,15 +249,21 @@ final class McpBusinessTools
         if (!is_int($limit) || $limit < 1 || $limit > 100) {
             throw new \InvalidArgumentException('limit must be between 1 and 100');
         }
+        $offset = $arguments['offset'] ?? 0;
+        if (!is_int($offset) || $offset < 0 || $offset > 1000000) {
+            throw new \InvalidArgumentException('offset must be between 0 and 1000000');
+        }
 
         $rows = $this->provider()->query($dataset, [
             'from' => $arguments['from'] ?? null,
             'to' => $arguments['to'] ?? null,
             'company_id' => $companyId,
             'company_role' => $companyRole,
+            'record_id' => $recordId,
             'aggregate' => $aggregate,
             'group_by' => $groupBy,
             'limit' => $limit,
+            'offset' => $offset,
         ]);
 
         if ($aggregate) {
@@ -260,7 +277,7 @@ final class McpBusinessTools
                 : []);
         }
 
-        return ['dataset' => $dataset, 'count' => count($rows), 'rows' => $rows] + ($rows === []
+        return ['dataset' => $dataset, 'count' => count($rows), 'rows' => $rows, 'limit' => $limit, 'offset' => $offset, 'has_more' => count($rows) === $limit, 'next_offset' => $offset + count($rows)] + ($rows === []
             ? ['hint' => 'No rows matched. Confirm the date range and choose an accessible company from list_my_companies.']
             : []);
     }

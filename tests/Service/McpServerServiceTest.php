@@ -163,7 +163,7 @@ final class McpServerServiceTest extends TestCase
             'method' => 'tools/call',
             'params' => [
                 'name' => 'query_business_data',
-                'arguments' => ['dataset' => 'sales', 'from' => '2026-10-02', 'company_id' => 12, 'company_role' => 'customer', 'limit' => 25],
+                'arguments' => ['dataset' => 'sales', 'from' => '2026-10-02', 'company_id' => 12, 'company_role' => 'customer', 'record_id' => 73230, 'limit' => 25, 'offset' => 50],
             ],
         ]);
 
@@ -171,7 +171,10 @@ final class McpServerServiceTest extends TestCase
         self::assertSame('sales', $queryProvider->received[0]);
         self::assertSame(12, $queryProvider->received[1]['company_id']);
         self::assertSame(25, $queryProvider->received[1]['limit']);
+        self::assertSame(73230, $queryProvider->received[1]['record_id']);
+        self::assertSame(50, $queryProvider->received[1]['offset']);
         self::assertSame(125.5, $data['rows'][0]['total']);
+        self::assertFalse($data['has_more']);
         self::assertArrayNotHasKey('document', $data['rows'][0]);
 
         $summary = $service->handle([
