@@ -147,6 +147,9 @@ class McpServerService
                     ],
                 ],
                 ...McpBusinessTools::definitions(!$this->isReadOnly()),
+                ...($this->businessTools?->canLinkedIn()
+                    ? McpBusinessTools::linkedInDefinitions(!$this->isReadOnly())
+                    : []),
                 [
                     'name' => 'list_capabilities',
                     'description' => 'Lists current MCP capabilities and write policy.',
@@ -173,7 +176,7 @@ class McpServerService
             throw new \InvalidArgumentException('Tool name is required');
         }
 
-        if ($name === 'write_business_data' && $this->isReadOnly()) {
+        if (in_array($name, ['write_business_data', 'linkedin_create_post'], true) && $this->isReadOnly()) {
             throw new \InvalidArgumentException('Write operations are disabled');
         }
 
@@ -186,7 +189,8 @@ class McpServerService
                 'time' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format(\DateTimeInterface::ATOM),
             ],
             'list_my_companies' => $this->listMyCompanies(),
-            'list_query_datasets', 'query_business_data' => $this->businessTools?->call((string) $name, $arguments)
+            'list_query_datasets', 'query_business_data', 'write_business_data',
+            'linkedin_status', 'linkedin_create_post' => $this->businessTools?->call((string) $name, $arguments)
                 ?? throw new \RuntimeException('Business data tools are not configured'),
             'list_capabilities' => $this->discovery(),
             default => throw new \InvalidArgumentException("Unknown tool: {$name}"),

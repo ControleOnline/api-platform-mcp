@@ -15,12 +15,23 @@ final class McpBusinessTools
     public function __construct(
         private readonly ?McpReadQueryProviderInterface $provider = null,
         private readonly ?McpWriteOperationProviderInterface $writeProvider = null,
+        private readonly ?McpLinkedInProviderInterface $linkedInProvider = null,
     ) {
     }
 
     public function canWrite(): bool
     {
         return $this->writeProvider !== null;
+    }
+
+    public function canLinkedIn(): bool
+    {
+        return $this->linkedInProvider !== null;
+    }
+
+    public function canLinkedInWrite(): bool
+    {
+        return $this->linkedInProvider !== null;
     }
 
     /** @return list<array<string, mixed>> */
@@ -115,6 +126,59 @@ final class McpBusinessTools
         return $definitions;
     }
 
+    /**
+     * LinkedIn tool definitions when a provider is registered.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public static function linkedInDefinitions(bool $includeWrite = true): array
+    {
+        $tools = [
+            [
+                'name' => 'linkedin_status',
+                'description' => 'Returns LinkedIn OAuth connection status for a company (connected, member name, scopes, expiry). Call list_my_companies first to resolve company_id.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'company_id' => [
+                            'type' => 'integer',
+                            'minimum' => 1,
+                            'description' => 'Company id from list_my_companies.',
+                        ],
+                    ],
+                    'required' => ['company_id'],
+                    'additionalProperties' => false,
+                ],
+            ],
+        ];
+
+        if ($includeWrite) {
+            $tools[] = [
+                'name' => 'linkedin_create_post',
+                'description' => 'Publishes a public text post on the LinkedIn member profile connected to the company. Requires prior OAuth connect in Manager > Integrations > LinkedIn. Call list_my_companies first for company_id.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'company_id' => [
+                            'type' => 'integer',
+                            'minimum' => 1,
+                            'description' => 'Company id from list_my_companies.',
+                        ],
+                        'text' => [
+                            'type' => 'string',
+                            'minLength' => 1,
+                            'description' => 'Post body text (UGC share commentary).',
+                        ],
+                    ],
+                    'required' => ['company_id', 'text'],
+                    'additionalProperties' => false,
+                ],
+            ];
+        }
+
+        return $tools;
+    }
+
     /** @param array<string, mixed> $arguments
      *  @return array<string, mixed>
      */
@@ -124,8 +188,46 @@ final class McpBusinessTools
             'list_query_datasets' => $this->listDatasets(),
             'query_business_data' => $this->queryBusinessData($arguments),
             'write_business_data' => $this->writeBusinessData($arguments),
+            'linkedin_status' => $this->linkedinStatus($arguments),
+            'linkedin_create_post' => $this->linkedinCreatePost($arguments),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
+    }
+
+    /** @param array<string, mixed> $arguments
+     *  @return array<string, mixed>
+     */
+    private function linkedinStatus(array $arguments): array
+    {
+        if ($this->linkedInProvider === null) {
+            throw new \RuntimeException('LinkedIn tools are not configured');
+        }
+        $companyId = $arguments['company_id'] ?? null;
+        if (!is_int($companyId) || $companyId < 1) {
+            throw new \InvalidArgumentException('company_id is required');
+        }
+
+        return $this->linkedInProvider->getStatus($companyId);
+    }
+
+    /** @param array<string, mixed> $arguments
+     *  @return array<string, mixed>
+     */
+    private function linkedinCreatePost(array $arguments): array
+    {
+        if ($this->linkedInProvider === null) {
+            throw new \RuntimeException('LinkedIn tools are not configured');
+        }
+        $companyId = $arguments['company_id'] ?? null;
+        $text = $arguments['text'] ?? null;
+        if (!is_int($companyId) || $companyId < 1) {
+            throw new \InvalidArgumentException('company_id is required');
+        }
+        if (!is_string($text) || trim($text) === '') {
+            throw new \InvalidArgumentException('text is required');
+        }
+
+        return $this->linkedInProvider->createPost($companyId, trim($text));
     }
 
     /** @param array<string, mixed> $arguments
