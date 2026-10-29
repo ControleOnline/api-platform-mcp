@@ -12,6 +12,19 @@ services:
         autowire: true
         autoconfigure: true
 
+    ControleOnline\Service\McpMarketplaceTools:
+        arguments:
+            $providers: !tagged_iterator controleonline.mcp.marketplace_provider
+        autowire: true
+        autoconfigure: true
+
+    ControleOnline\Service\McpMarketplaceAuthorizationProviderInterface:
+        alias: ControleOnline\Service\McpMarketplaceAuthorizationProvider
+
+    ControleOnline\Service\McpMarketplaceAuthorizationProvider:
+        autowire: true
+        autoconfigure: true
+
     ControleOnline\Service\McpCompanyScopeProviderInterface:
         alias: ControleOnline\Service\PeopleRoleCompanyScopeProvider
 

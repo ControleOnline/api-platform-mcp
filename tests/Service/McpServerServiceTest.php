@@ -309,4 +309,37 @@ final class McpServerServiceTest extends TestCase
         $this->assertArrayHasKey('error', $response);
         $this->assertSame(-32601, $response['error']['code']);
     }
+
+    public function testLinkedInToolsAppearWhenProviderIsRegistered(): void
+    {
+        $linkedIn = new class implements \ControleOnline\Service\McpLinkedInProviderInterface {
+            public function getStatus(int $companyId): array
+            {
+                return ['connected' => true, 'company_id' => $companyId];
+            }
+
+            public function createPost(int $companyId, string $text): array
+            {
+                return ['success' => true, 'post_id' => 'urn:li:share:1', 'company_id' => $companyId, 'text' => $text];
+            }
+        };
+        $tools = new \ControleOnline\Service\McpBusinessTools(null, null, $linkedIn);
+        $service = new McpServerService(false, null, $tools);
+        $names = array_column($service->handle([
+            'jsonrpc' => '2.0', 'id' => 9, 'method' => 'tools/list',
+        ])['result']['tools'], 'name');
+        $this->assertContains('linkedin_status', $names);
+        $this->assertContains('linkedin_create_post', $names);
+
+        $status = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 10,
+            'method' => 'tools/call',
+            'params' => ['name' => 'linkedin_status', 'arguments' => ['company_id' => 1]],
+        ]);
+        $this->assertArrayHasKey('result', $status);
+        $payload = json_decode($status['result']['content'][0]['text'], true);
+        $this->assertTrue($payload['connected']);
+    }
+
 }

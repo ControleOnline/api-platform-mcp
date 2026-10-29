@@ -42,7 +42,7 @@ Datas de vendas e faturas usam o fuso `APP_TIMEZONE` da API. O escopo de empresa
 
 O fluxo usa `cache.app` e o `lock.factory` da Symfony para consumir cada código de autorização uma só vez. Em instalações com mais de um nó API, configure ambos com armazenamento compartilhado entre os nós.
 
-Mais detalhes: [fluxo OAuth e isolamento por tenant](docs/oauth-multitenancy.md).
+Mais detalhes: [fluxo OAuth e isolamento por tenant](docs/oauth-multitenancy.md). Consulte também o [contrato de autorização e auditoria de marketplaces](docs/marketplace-authorization.md).
 
 ## Instalacao
 
