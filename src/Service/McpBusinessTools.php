@@ -16,6 +16,7 @@ final class McpBusinessTools
         private readonly ?McpReadQueryProviderInterface $provider = null,
         private readonly ?McpWriteOperationProviderInterface $writeProvider = null,
         private readonly ?McpLinkedInProviderInterface $linkedInProvider = null,
+        private readonly ?McpMercadoLivreProviderInterface $mercadoLivreProvider = null,
     ) {
     }
 
