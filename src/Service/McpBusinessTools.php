@@ -35,6 +35,41 @@ final class McpBusinessTools
         return $this->linkedInProvider !== null;
     }
 
+    public function canMercadoLivre(): bool
+    {
+        return $this->mercadoLivreProvider !== null;
+    }
+
+    /** @return list<array<string, mixed>> */
+    public static function mercadoLivreDefinitions(bool $includeWrite = true): array
+    {
+        $company = ['company_id' => ['type' => 'integer', 'minimum' => 1]];
+        $specs = [
+            ['mercadolivre_status', 'Returns the connected Mercado Livre status without exposing tokens.', $company, ['company_id']],
+            ['mercadolivre_get_current_user', 'Reads the connected Mercado Livre seller identity.', $company, ['company_id']],
+            ['mercadolivre_search_items', 'Lists item ids for the connected seller with offset pagination.', $company + ['offset' => ['type' => 'integer', 'minimum' => 0], 'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100]], ['company_id']],
+            ['mercadolivre_get_item', 'Reads a Mercado Livre listing by item id.', $company + ['item_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'item_id']],
+            ['mercadolivre_get_item_description', 'Reads a Mercado Livre listing description.', $company + ['item_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'item_id']],
+            ['mercadolivre_get_category', 'Reads Mercado Livre category metadata.', $company + ['category_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'category_id']],
+            ['mercadolivre_get_order', 'Reads an order visible to the connected seller.', $company + ['order_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'order_id']],
+        ];
+        $definitions = [];
+        foreach ($specs as [$name, $description, $properties, $required]) {
+            $definitions[] = ['name' => $name, 'description' => $description, 'inputSchema' => [
+                'type' => 'object', 'properties' => $properties, 'required' => $required, 'additionalProperties' => false,
+            ]];
+        }
+        if ($includeWrite) {
+            $definitions[] = ['name' => 'mercadolivre_import_products',
+                'description' => 'Imports or updates products from the connected Mercado Livre seller into the selected local showcase. Does not publish or edit remote listings.',
+                'inputSchema' => ['type' => 'object', 'properties' => $company + [
+                    'showcase_id' => ['type' => 'integer', 'minimum' => 1],
+                    'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100],
+                ], 'required' => ['company_id', 'showcase_id'], 'additionalProperties' => false]];
+        }
+        return $definitions;
+    }
+
     /** @return list<array<string, mixed>> */
     public static function definitions(bool $includeWrites = false): array
     {
