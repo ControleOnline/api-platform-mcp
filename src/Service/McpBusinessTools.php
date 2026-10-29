@@ -268,6 +268,14 @@ final class McpBusinessTools
             'linkedin_get_profile' => $this->linkedinGetProfile($arguments),
             'linkedin_list_organizations' => $this->linkedinListOrganizations($arguments),
             'linkedin_create_organization_post' => $this->linkedinCreateOrganizationPost($arguments),
+            'mercadolivre_status' => $this->mercadoLivreStatus($arguments),
+            'mercadolivre_get_current_user' => $this->mercadoLivreSimpleCall($arguments, fn (int $id): array => $this->mercadoLivre()->getCurrentUser($id)),
+            'mercadolivre_search_items' => $this->mercadoLivreSearchItems($arguments),
+            'mercadolivre_get_item' => $this->mercadoLivreResource($arguments, 'item_id', fn (int $id, string $key): array => $this->mercadoLivre()->getItem($id, $key)),
+            'mercadolivre_get_item_description' => $this->mercadoLivreResource($arguments, 'item_id', fn (int $id, string $key): array => $this->mercadoLivre()->getItemDescription($id, $key)),
+            'mercadolivre_get_category' => $this->mercadoLivreResource($arguments, 'category_id', fn (int $id, string $key): array => $this->mercadoLivre()->getCategory($id, $key)),
+            'mercadolivre_get_order' => $this->mercadoLivreResource($arguments, 'order_id', fn (int $id, string $key): array => $this->mercadoLivre()->getOrder($id, $key)),
+            'mercadolivre_import_products' => $this->mercadoLivreImportProducts($arguments),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
     }
