@@ -143,7 +143,14 @@ final class McpMarketplaceToolsTest extends TestCase
             public function marketplace(): string { return 'mercadolivre'; }
             public function toolDefinitions(): array
             {
-                return [['name' => 'marketplace_mercadolivre_list_products', 'description' => 'List products', 'inputSchema' => ['type' => 'object', 'properties' => ['company_id' => ['type' => 'integer']]]];
+                return [[
+                    'name' => 'marketplace_mercadolivre_list_products',
+                    'description' => 'List products',
+                    'inputSchema' => [
+                        'type' => 'object',
+                        'properties' => ['company_id' => ['type' => 'integer']],
+                    ],
+                ]];
             }
             public function isWriteOperation(string $toolName): bool { return false; }
             public function execute(string $toolName, McpMarketplaceOperationContext $context, array $arguments, McpMarketplaceAuthorizationProviderInterface $authorization): array
