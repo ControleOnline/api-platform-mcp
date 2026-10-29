@@ -15,12 +15,48 @@ final class McpBusinessTools
     public function __construct(
         private readonly ?McpReadQueryProviderInterface $provider = null,
         private readonly ?McpWriteOperationProviderInterface $writeProvider = null,
+        private readonly ?McpMercadoLivreProviderInterface $mercadoLivreProvider = null,
     ) {
     }
 
     public function canWrite(): bool
     {
         return $this->writeProvider !== null;
+    }
+
+    public function canMercadoLivre(): bool
+    {
+        return $this->mercadoLivreProvider !== null;
+    }
+
+    /** @return list<array<string, mixed>> */
+    public static function mercadoLivreDefinitions(bool $includeWrite = true): array
+    {
+        $company = ['company_id' => ['type' => 'integer', 'minimum' => 1]];
+        $specs = [
+            ['mercadolivre_status', 'Returns the connected Mercado Livre status without exposing tokens.', $company, ['company_id']],
+            ['mercadolivre_get_current_user', 'Reads the connected Mercado Livre seller identity.', $company, ['company_id']],
+            ['mercadolivre_search_items', 'Lists item ids for the connected seller with offset pagination.', $company + ['offset' => ['type' => 'integer', 'minimum' => 0], 'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100]], ['company_id']],
+            ['mercadolivre_get_item', 'Reads a Mercado Livre listing by item id.', $company + ['item_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'item_id']],
+            ['mercadolivre_get_item_description', 'Reads a Mercado Livre listing description.', $company + ['item_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'item_id']],
+            ['mercadolivre_get_category', 'Reads Mercado Livre category metadata.', $company + ['category_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'category_id']],
+            ['mercadolivre_get_order', 'Reads an order visible to the connected seller.', $company + ['order_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'order_id']],
+        ];
+        $definitions = [];
+        foreach ($specs as [$name, $description, $properties, $required]) {
+            $definitions[] = ['name' => $name, 'description' => $description, 'inputSchema' => [
+                'type' => 'object', 'properties' => $properties, 'required' => $required, 'additionalProperties' => false,
+            ]];
+        }
+        if ($includeWrite) {
+            $definitions[] = ['name' => 'mercadolivre_import_products',
+                'description' => 'Imports or updates products from the connected Mercado Livre seller into the selected local showcase. Does not publish or edit remote listings.',
+                'inputSchema' => ['type' => 'object', 'properties' => $company + [
+                    'showcase_id' => ['type' => 'integer', 'minimum' => 1],
+                    'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100],
+                ], 'required' => ['company_id', 'showcase_id'], 'additionalProperties' => false]];
+        }
+        return $definitions;
     }
 
     /** @return list<array<string, mixed>> */
@@ -126,6 +162,14 @@ final class McpBusinessTools
             'list_query_datasets' => $this->listDatasets(),
             'query_business_data' => $this->queryBusinessData($arguments),
             'write_business_data' => $this->writeBusinessData($arguments),
+            'mercadolivre_status' => $this->mercadoLivreStatus($arguments),
+            'mercadolivre_get_current_user' => $this->mercadoLivreSimpleCall($arguments, fn (int $id): array => $this->mercadoLivre()->getCurrentUser($id)),
+            'mercadolivre_search_items' => $this->mercadoLivreSearchItems($arguments),
+            'mercadolivre_get_item' => $this->mercadoLivreResource($arguments, 'item_id', fn (int $id, string $key): array => $this->mercadoLivre()->getItem($id, $key)),
+            'mercadolivre_get_item_description' => $this->mercadoLivreResource($arguments, 'item_id', fn (int $id, string $key): array => $this->mercadoLivre()->getItemDescription($id, $key)),
+            'mercadolivre_get_category' => $this->mercadoLivreResource($arguments, 'category_id', fn (int $id, string $key): array => $this->mercadoLivre()->getCategory($id, $key)),
+            'mercadolivre_get_order' => $this->mercadoLivreResource($arguments, 'order_id', fn (int $id, string $key): array => $this->mercadoLivre()->getOrder($id, $key)),
+            'mercadolivre_import_products' => $this->mercadoLivreImportProducts($arguments),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
     }
@@ -133,6 +177,59 @@ final class McpBusinessTools
     /** @param array<string, mixed> $arguments
      *  @return array<string, mixed>
      */
+    private function mercadoLivre(): McpMercadoLivreProviderInterface
+    {
+        return $this->mercadoLivreProvider ?? throw new \RuntimeException('Mercado Livre tools are not configured');
+    }
+
+    private function mercadoLivreCompanyId(array $arguments): int
+    {
+        $id = $arguments['company_id'] ?? null;
+        if (!is_int($id) || $id < 1) {
+            throw new \InvalidArgumentException('company_id is required');
+        }
+        return $id;
+    }
+
+    private function mercadoLivreStatus(array $arguments): array
+    {
+        return $this->mercadoLivre()->getStatus($this->mercadoLivreCompanyId($arguments));
+    }
+
+    private function mercadoLivreSimpleCall(array $arguments, callable $callback): array
+    {
+        return $callback($this->mercadoLivreCompanyId($arguments));
+    }
+
+    private function mercadoLivreResource(array $arguments, string $field, callable $callback): array
+    {
+        $id = $arguments[$field] ?? null;
+        if (!is_string($id) || trim($id) === '' || strlen($id) > 128) {
+            throw new \InvalidArgumentException($field . ' is required');
+        }
+        return $callback($this->mercadoLivreCompanyId($arguments), trim($id));
+    }
+
+    private function mercadoLivreSearchItems(array $arguments): array
+    {
+        $offset = $arguments['offset'] ?? 0;
+        $limit = $arguments['limit'] ?? 50;
+        if (!is_int($offset) || $offset < 0 || !is_int($limit) || $limit < 1 || $limit > 100) {
+            throw new \InvalidArgumentException('offset/limit are invalid');
+        }
+        return $this->mercadoLivre()->searchItems($this->mercadoLivreCompanyId($arguments), $offset, $limit);
+    }
+
+    private function mercadoLivreImportProducts(array $arguments): array
+    {
+        $showcaseId = $arguments['showcase_id'] ?? null;
+        $limit = $arguments['limit'] ?? 50;
+        if (!is_int($showcaseId) || $showcaseId < 1 || !is_int($limit) || $limit < 1 || $limit > 100) {
+            throw new \InvalidArgumentException('showcase_id and limit are invalid');
+        }
+        return $this->mercadoLivre()->importProducts($this->mercadoLivreCompanyId($arguments), $showcaseId, $limit);
+    }
+
     private function writeBusinessData(array $arguments): array
     {
         $operation = $arguments['operation'] ?? null;
