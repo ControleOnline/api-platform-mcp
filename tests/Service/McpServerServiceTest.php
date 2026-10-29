@@ -342,7 +342,7 @@ final class McpServerServiceTest extends TestCase
 
     public function testMercadoLivreToolsAreRegisteredAndTenantScopedProviderIsCalled(): void
     {
-        $provider = new class implements \\ControleOnline\\Service\\McpMercadoLivreProviderInterface {
+        $provider = new class implements \ControleOnline\Service\\McpMercadoLivreProviderInterface {
             public function getStatus(int $companyId): array { return ['company_id' => $companyId, 'connected' => true]; }
             public function getCurrentUser(int $companyId): array { return ['company_id' => $companyId, 'id' => 'seller-1']; }
             public function searchItems(int $companyId, int $offset = 0, int $limit = 50): array { return ['company_id' => $companyId, 'results' => ['MLB123'], 'offset' => $offset, 'limit' => $limit]; }
@@ -352,7 +352,7 @@ final class McpServerServiceTest extends TestCase
             public function getOrder(int $companyId, string $orderId): array { return ['company_id' => $companyId, 'id' => $orderId]; }
             public function importProducts(int $companyId, int $showcaseId, int $limit = 50): array { return ['company_id' => $companyId, 'showcase_id' => $showcaseId, 'imported_count' => 2]; }
         };
-        $tools = new \\ControleOnline\\Service\\McpBusinessTools(null, null, null, $provider);
+        $tools = new \ControleOnline\Service\\McpBusinessTools(null, null, null, $provider);
         $service = new McpServerService(true, null, $tools);
         $listed = $service->handle(['jsonrpc' => '2.0', 'id' => 20, 'method' => 'tools/list']);
         $names = array_column($listed['result']['tools'], 'name');
