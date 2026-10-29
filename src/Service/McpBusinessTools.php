@@ -140,11 +140,43 @@ final class McpBusinessTools
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
-                        'company_id' => [
-                            'type' => 'integer',
-                            'minimum' => 1,
-                            'description' => 'Company id from list_my_companies.',
-                        ],
+                        'company_id' => ['type' => 'integer', 'minimum' => 1, 'description' => 'Company id from list_my_companies.'],
+                    ],
+                    'required' => ['company_id'],
+                    'additionalProperties' => false,
+                ],
+            ],
+            [
+                'name' => 'linkedin_capabilities',
+                'description' => 'Lists LinkedIn capabilities enabled by the current OAuth token scopes, and explicit limitations (e.g. profile field edit is not available via API).',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'company_id' => ['type' => 'integer', 'minimum' => 1],
+                    ],
+                    'required' => ['company_id'],
+                    'additionalProperties' => false,
+                ],
+            ],
+            [
+                'name' => 'linkedin_get_profile',
+                'description' => 'Reads OpenID/basic LinkedIn profile of the connected member (name, email, picture, optional /v2/me). Cannot update headline/about/experience via API — LinkedIn blocks third-party profile edits.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'company_id' => ['type' => 'integer', 'minimum' => 1],
+                    ],
+                    'required' => ['company_id'],
+                    'additionalProperties' => false,
+                ],
+            ],
+            [
+                'name' => 'linkedin_list_organizations',
+                'description' => 'Lists LinkedIn company pages the member administers. Requires Community Management API + rw_organization_admin scope (reconnect OAuth after enabling the product).',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'company_id' => ['type' => 'integer', 'minimum' => 1],
                     ],
                     'required' => ['company_id'],
                     'additionalProperties' => false,
@@ -155,22 +187,32 @@ final class McpBusinessTools
         if ($includeWrite) {
             $tools[] = [
                 'name' => 'linkedin_create_post',
-                'description' => 'Publishes a public text post on the LinkedIn member profile connected to the company. Requires prior OAuth connect in Manager > Integrations > LinkedIn. Call list_my_companies first for company_id.',
+                'description' => 'Publishes a public text post on the connected LinkedIn member profile (w_member_social).',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
-                        'company_id' => [
-                            'type' => 'integer',
-                            'minimum' => 1,
-                            'description' => 'Company id from list_my_companies.',
-                        ],
-                        'text' => [
-                            'type' => 'string',
-                            'minLength' => 1,
-                            'description' => 'Post body text (UGC share commentary).',
-                        ],
+                        'company_id' => ['type' => 'integer', 'minimum' => 1],
+                        'text' => ['type' => 'string', 'minLength' => 1],
                     ],
                     'required' => ['company_id', 'text'],
+                    'additionalProperties' => false,
+                ],
+            ];
+            $tools[] = [
+                'name' => 'linkedin_create_organization_post',
+                'description' => 'Publishes a public text post as a LinkedIn company page. Requires w_organization_social, page admin role, and organization_urn from linkedin_list_organizations.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'company_id' => ['type' => 'integer', 'minimum' => 1],
+                        'organization_urn' => [
+                            'type' => 'string',
+                            'minLength' => 1,
+                            'description' => 'urn:li:organization:{id} or numeric organization id',
+                        ],
+                        'text' => ['type' => 'string', 'minLength' => 1],
+                    ],
+                    'required' => ['company_id', 'organization_urn', 'text'],
                     'additionalProperties' => false,
                 ],
             ];
@@ -178,10 +220,6 @@ final class McpBusinessTools
 
         return $tools;
     }
-
-    /** @param array<string, mixed> $arguments
-     *  @return array<string, mixed>
-     */
     public function call(string $name, array $arguments): array
     {
         return match ($name) {
@@ -190,6 +228,10 @@ final class McpBusinessTools
             'write_business_data' => $this->writeBusinessData($arguments),
             'linkedin_status' => $this->linkedinStatus($arguments),
             'linkedin_create_post' => $this->linkedinCreatePost($arguments),
+            'linkedin_capabilities' => $this->linkedinCapabilities($arguments),
+            'linkedin_get_profile' => $this->linkedinGetProfile($arguments),
+            'linkedin_list_organizations' => $this->linkedinListOrganizations($arguments),
+            'linkedin_create_organization_post' => $this->linkedinCreateOrganizationPost($arguments),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
     }
@@ -375,4 +417,66 @@ final class McpBusinessTools
 
         return $this->provider;
     }
+    /** @param array<string, mixed> $arguments
+     *  @return array<string, mixed>
+     */
+    private function linkedinCapabilities(array $arguments): array
+    {
+        return $this->linkedInProvider()->getCapabilities($this->requireCompanyId($arguments));
+    }
+
+    /** @param array<string, mixed> $arguments
+     *  @return array<string, mixed>
+     */
+    private function linkedinGetProfile(array $arguments): array
+    {
+        return $this->linkedInProvider()->getProfile($this->requireCompanyId($arguments));
+    }
+
+    /** @param array<string, mixed> $arguments
+     *  @return array<string, mixed>
+     */
+    private function linkedinListOrganizations(array $arguments): array
+    {
+        return $this->linkedInProvider()->listOrganizations($this->requireCompanyId($arguments));
+    }
+
+    /** @param array<string, mixed> $arguments
+     *  @return array<string, mixed>
+     */
+    private function linkedinCreateOrganizationPost(array $arguments): array
+    {
+        $companyId = $this->requireCompanyId($arguments);
+        $organizationUrn = $arguments['organization_urn'] ?? null;
+        $text = $arguments['text'] ?? null;
+        if (!is_string($organizationUrn) || trim($organizationUrn) === '') {
+            throw new \InvalidArgumentException('organization_urn is required');
+        }
+        if (!is_string($text) || trim($text) === '') {
+            throw new \InvalidArgumentException('text is required');
+        }
+
+        return $this->linkedInProvider()->createOrganizationPost($companyId, trim($organizationUrn), trim($text));
+    }
+
+    /** @param array<string, mixed> $arguments */
+    private function requireCompanyId(array $arguments): int
+    {
+        $companyId = $arguments['company_id'] ?? null;
+        if (!is_int($companyId) || $companyId < 1) {
+            throw new \InvalidArgumentException('company_id is required');
+        }
+
+        return $companyId;
+    }
+
+    private function linkedInProvider(): McpLinkedInProviderInterface
+    {
+        if ($this->linkedInProvider === null) {
+            throw new \RuntimeException('LinkedIn tools are not configured');
+        }
+
+        return $this->linkedInProvider;
+    }
+
 }

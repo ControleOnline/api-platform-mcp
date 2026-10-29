@@ -10,17 +10,21 @@ namespace ControleOnline\Service;
  */
 interface McpLinkedInProviderInterface
 {
-    /**
-     * Connection status for a company the current user can access.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public function getStatus(int $companyId): array;
 
-    /**
-     * Publish a personal member text post for the connected company account.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public function createPost(int $companyId, string $text): array;
+
+    /** @return array<string, mixed> */
+    public function getProfile(int $companyId): array;
+
+    /** @return array<string, mixed> */
+    public function listOrganizations(int $companyId): array;
+
+    /** @return array<string, mixed> */
+    public function createOrganizationPost(int $companyId, string $organizationUrn, string $text): array;
+
+    /** @return array<string, mixed> */
+    public function getCapabilities(int $companyId): array;
 }
