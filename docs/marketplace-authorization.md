@@ -11,12 +11,13 @@ lowercase marketplace slug and names tools with the prefix
   from tool arguments.
 - Every operation requires a positive `company_id` present in the current
   user's server-resolved company scope.
-- `McpMarketplaceAuthorizationProviderInterface::assertAllowed()` checks current
-  access to the company, connection, operation and resource.
-- The provider must call `assertAllowed()` again immediately before every
-  external write. A prior authorization result is not a durable grant.
+- `McpMarketplaceAuthorizationProvider` derives the user from Symfony's server-side
+  security token and checks the current company scope on every authorization call.
+- The adapter must call `assertAllowed()` again immediately before every external
+  write; a prior authorization result is not a durable grant.
 - Connection and marketplace resource IDs from the client are selectors only.
-  The provider must resolve them in the selected tenant and confirm ownership.
+  Each adapter must resolve them in the selected tenant, confirm ownership, and
+  enforce operation-specific permissions before reading or changing a resource.
 - Marketplace tools are not exposed if provider, authorization, company scope,
   or audit logging is unavailable. Missing security dependencies fail closed.
 
