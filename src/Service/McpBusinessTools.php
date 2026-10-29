@@ -285,14 +285,14 @@ final class McpBusinessTools
      */
     private function mercadoLivre(): McpMercadoLivreProviderInterface
     {
-        return $this->mercadoLivreProvider ?? throw new \\RuntimeException('Mercado Livre tools are not configured');
+        return $this->mercadoLivreProvider ?? throw new \RuntimeException('Mercado Livre tools are not configured');
     }
 
     private function mercadoLivreCompanyId(array $arguments): int
     {
         $id = $arguments['company_id'] ?? null;
         if (!is_int($id) || $id < 1) {
-            throw new \\InvalidArgumentException('company_id is required');
+            throw new \InvalidArgumentException('company_id is required');
         }
         return $id;
     }
@@ -311,7 +311,7 @@ final class McpBusinessTools
     {
         $id = $arguments[$field] ?? null;
         if (!is_string($id) || trim($id) === '' || strlen($id) > 128) {
-            throw new \\InvalidArgumentException($field . ' is required');
+            throw new \InvalidArgumentException($field . ' is required');
         }
         return $callback($this->mercadoLivreCompanyId($arguments), trim($id));
     }
@@ -321,7 +321,7 @@ final class McpBusinessTools
         $offset = $arguments['offset'] ?? 0;
         $limit = $arguments['limit'] ?? 50;
         if (!is_int($offset) || $offset < 0 || !is_int($limit) || $limit < 1 || $limit > 100) {
-            throw new \\InvalidArgumentException('offset/limit are invalid');
+            throw new \InvalidArgumentException('offset/limit are invalid');
         }
         return $this->mercadoLivre()->searchItems($this->mercadoLivreCompanyId($arguments), $offset, $limit);
     }
@@ -331,7 +331,7 @@ final class McpBusinessTools
         $showcaseId = $arguments['showcase_id'] ?? null;
         $limit = $arguments['limit'] ?? 50;
         if (!is_int($showcaseId) || $showcaseId < 1 || !is_int($limit) || $limit < 1 || $limit > 100) {
-            throw new \\InvalidArgumentException('showcase_id and limit are invalid');
+            throw new \InvalidArgumentException('showcase_id and limit are invalid');
         }
         return $this->mercadoLivre()->importProducts($this->mercadoLivreCompanyId($arguments), $showcaseId, $limit);
     }
