@@ -9,6 +9,6 @@ interface McpMarketplaceAuthorizationProviderInterface
     /** Resolve the authenticated user from the server-side security context. */
     public function currentUserId(): int;
 
-    /** Re-check current access to the company, connection, operation and resource. */
+    /** Re-check the server-authenticated user and current company access. */
     public function assertAllowed(McpMarketplaceOperationContext $context): void;
 }
