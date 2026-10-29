@@ -283,6 +283,59 @@ final class McpBusinessTools
     /** @param array<string, mixed> $arguments
      *  @return array<string, mixed>
      */
+    private function mercadoLivre(): McpMercadoLivreProviderInterface
+    {
+        return $this->mercadoLivreProvider ?? throw new \\RuntimeException('Mercado Livre tools are not configured');
+    }
+
+    private function mercadoLivreCompanyId(array $arguments): int
+    {
+        $id = $arguments['company_id'] ?? null;
+        if (!is_int($id) || $id < 1) {
+            throw new \\InvalidArgumentException('company_id is required');
+        }
+        return $id;
+    }
+
+    private function mercadoLivreStatus(array $arguments): array
+    {
+        return $this->mercadoLivre()->getStatus($this->mercadoLivreCompanyId($arguments));
+    }
+
+    private function mercadoLivreSimpleCall(array $arguments, callable $callback): array
+    {
+        return $callback($this->mercadoLivreCompanyId($arguments));
+    }
+
+    private function mercadoLivreResource(array $arguments, string $field, callable $callback): array
+    {
+        $id = $arguments[$field] ?? null;
+        if (!is_string($id) || trim($id) === '' || strlen($id) > 128) {
+            throw new \\InvalidArgumentException($field . ' is required');
+        }
+        return $callback($this->mercadoLivreCompanyId($arguments), trim($id));
+    }
+
+    private function mercadoLivreSearchItems(array $arguments): array
+    {
+        $offset = $arguments['offset'] ?? 0;
+        $limit = $arguments['limit'] ?? 50;
+        if (!is_int($offset) || $offset < 0 || !is_int($limit) || $limit < 1 || $limit > 100) {
+            throw new \\InvalidArgumentException('offset/limit are invalid');
+        }
+        return $this->mercadoLivre()->searchItems($this->mercadoLivreCompanyId($arguments), $offset, $limit);
+    }
+
+    private function mercadoLivreImportProducts(array $arguments): array
+    {
+        $showcaseId = $arguments['showcase_id'] ?? null;
+        $limit = $arguments['limit'] ?? 50;
+        if (!is_int($showcaseId) || $showcaseId < 1 || !is_int($limit) || $limit < 1 || $limit > 100) {
+            throw new \\InvalidArgumentException('showcase_id and limit are invalid');
+        }
+        return $this->mercadoLivre()->importProducts($this->mercadoLivreCompanyId($arguments), $showcaseId, $limit);
+    }
+
     private function linkedinStatus(array $arguments): array
     {
         if ($this->linkedInProvider === null) {
