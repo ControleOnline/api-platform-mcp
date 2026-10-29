@@ -27,6 +27,7 @@ class McpServerService
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
         private readonly ?McpBusinessTools $businessTools = null,
         private readonly ?LoggerInterface $logger = null,
+        private readonly ?McpMarketplaceTools $marketplaceTools = null,
     ) {
     }
 
@@ -150,6 +151,7 @@ class McpServerService
                 ...($this->businessTools?->canLinkedIn()
                     ? McpBusinessTools::linkedInDefinitions(!$this->isReadOnly())
                     : []),
+                ...($this->marketplaceTools?->definitions(!$this->isReadOnly()) ?? []),
                 [
                     'name' => 'list_capabilities',
                     'description' => 'Lists current MCP capabilities and write policy.',
@@ -176,7 +178,8 @@ class McpServerService
             throw new \InvalidArgumentException('Tool name is required');
         }
 
-        if (in_array($name, ['write_business_data', 'linkedin_create_post', 'linkedin_create_organization_post'], true) && $this->isReadOnly()) {
+        if ((in_array($name, ['write_business_data', 'linkedin_create_post', 'linkedin_create_organization_post'], true)
+            || ($this->marketplaceTools?->isWriteOperation((string) $name) ?? false)) && $this->isReadOnly()) {
             throw new \InvalidArgumentException('Write operations are disabled');
         }
 
@@ -194,7 +197,9 @@ class McpServerService
             'linkedin_list_organizations', 'linkedin_create_organization_post' => $this->businessTools?->call((string) $name, $arguments)
                 ?? throw new \RuntimeException('Business data tools are not configured'),
             'list_capabilities' => $this->discovery(),
-            default => throw new \InvalidArgumentException("Unknown tool: {$name}"),
+            default => ($this->marketplaceTools?->supportsTool((string) $name) ?? false)
+                ? $this->marketplaceTools->call((string) $name, $arguments)
+                : throw new \InvalidArgumentException("Unknown tool: {$name}"),
         };
 
         return [
