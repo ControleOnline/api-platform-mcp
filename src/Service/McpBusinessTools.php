@@ -43,6 +43,7 @@ final class McpBusinessTools
             ['mercadolivre_get_item_description', 'Reads a Mercado Livre listing description.', $company + ['item_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'item_id']],
             ['mercadolivre_get_category', 'Reads Mercado Livre category metadata.', $company + ['category_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'category_id']],
             ['mercadolivre_get_order', 'Reads an order visible to the connected seller.', $company + ['order_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'order_id']],
+            ['mercadolivre_search_orders', 'Lists recent Mercado Livre orders for the connected seller.', $company + ['offset' => ['type' => 'integer', 'minimum' => 0], 'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 50], 'status' => ['type' => 'string']], ['company_id']],
         ];
         $definitions = [];
         foreach ($specs as [$name, $description, $properties, $required]) {
@@ -51,6 +52,12 @@ final class McpBusinessTools
             ]];
         }
         if ($includeWrite) {
+            $definitions[] = ['name' => 'mercadolivre_import_orders',
+                'description' => 'Imports recent Mercado Livre seller orders into local Order records. Skips already imported ids.',
+                'inputSchema' => ['type' => 'object', 'properties' => $company + [
+                    'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 50],
+                    'status' => ['type' => 'string'],
+                ], 'required' => ['company_id'], 'additionalProperties' => false]];
             $definitions[] = ['name' => 'mercadolivre_import_products',
                 'description' => 'Imports or updates products from the connected Mercado Livre seller into the selected local showcase. Does not publish or edit remote listings.',
                 'inputSchema' => ['type' => 'object', 'properties' => $company + [
@@ -175,6 +182,8 @@ final class McpBusinessTools
             'mercadolivre_get_item_description' => $this->mercadoLivreResource($arguments, 'item_id', fn (int $id, string $key): array => $this->mercadoLivre()->getItemDescription($id, $key)),
             'mercadolivre_get_category' => $this->mercadoLivreResource($arguments, 'category_id', fn (int $id, string $key): array => $this->mercadoLivre()->getCategory($id, $key)),
             'mercadolivre_get_order' => $this->mercadoLivreResource($arguments, 'order_id', fn (int $id, string $key): array => $this->mercadoLivre()->getOrder($id, $key)),
+            'mercadolivre_search_orders' => $this->mercadoLivreSearchOrders($arguments),
+            'mercadolivre_import_orders' => $this->mercadoLivreImportOrders($arguments),
             'mercadolivre_import_products' => $this->mercadoLivreImportProducts($arguments),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
@@ -224,6 +233,23 @@ final class McpBusinessTools
             throw new \InvalidArgumentException('offset/limit are invalid');
         }
         return $this->mercadoLivre()->searchItems($this->mercadoLivreCompanyId($arguments), $offset, $limit);
+    }
+
+    private function mercadoLivreSearchOrders(array $arguments): array
+    {
+        $offset = isset($arguments['offset']) && is_int($arguments['offset']) ? $arguments['offset'] : 0;
+        $limit = isset($arguments['limit']) && is_int($arguments['limit']) ? $arguments['limit'] : 50;
+        $status = isset($arguments['status']) && is_string($arguments['status']) ? $arguments['status'] : null;
+
+        return $this->mercadoLivre()->searchOrders($this->mercadoLivreCompanyId($arguments), $offset, $limit, $status);
+    }
+
+    private function mercadoLivreImportOrders(array $arguments): array
+    {
+        $limit = isset($arguments['limit']) && is_int($arguments['limit']) ? $arguments['limit'] : 20;
+        $status = isset($arguments['status']) && is_string($arguments['status']) ? $arguments['status'] : null;
+
+        return $this->mercadoLivre()->importOrders($this->mercadoLivreCompanyId($arguments), $limit, $status);
     }
 
     private function mercadoLivreImportProducts(array $arguments): array
