@@ -150,6 +150,9 @@ class McpServerService
                 ...($this->businessTools?->canLinkedIn()
                     ? McpBusinessTools::linkedInDefinitions(!$this->isReadOnly())
                     : []),
+                ...($this->businessTools?->canMercadoLivre()
+                    ? McpBusinessTools::mercadoLivreDefinitions(!$this->isReadOnly())
+                    : []),
                 [
                     'name' => 'list_capabilities',
                     'description' => 'Lists current MCP capabilities and write policy.',
@@ -176,7 +179,7 @@ class McpServerService
             throw new \InvalidArgumentException('Tool name is required');
         }
 
-        if (in_array($name, ['write_business_data', 'linkedin_create_post', 'linkedin_create_organization_post'], true) && $this->isReadOnly()) {
+        if (in_array($name, ['write_business_data', 'linkedin_create_post', 'linkedin_create_organization_post', 'mercadolivre_import_products'], true) && $this->isReadOnly()) {
             throw new \InvalidArgumentException('Write operations are disabled');
         }
 
@@ -191,7 +194,10 @@ class McpServerService
             'list_my_companies' => $this->listMyCompanies(),
             'list_query_datasets', 'query_business_data', 'write_business_data',
             'linkedin_status', 'linkedin_create_post', 'linkedin_capabilities', 'linkedin_get_profile',
-            'linkedin_list_organizations', 'linkedin_create_organization_post' => $this->businessTools?->call((string) $name, $arguments)
+            'linkedin_list_organizations', 'linkedin_create_organization_post',
+            'mercadolivre_status', 'mercadolivre_get_current_user', 'mercadolivre_search_items',
+            'mercadolivre_get_item', 'mercadolivre_get_item_description', 'mercadolivre_get_category',
+            'mercadolivre_get_order', 'mercadolivre_import_products' => $this->businessTools?->call((string) $name, $arguments)
                 ?? throw new \RuntimeException('Business data tools are not configured'),
             'list_capabilities' => $this->discovery(),
             default => throw new \InvalidArgumentException("Unknown tool: {$name}"),
