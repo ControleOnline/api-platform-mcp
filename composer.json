@@ -24,8 +24,8 @@
     ],
     "require": {
         "php": "^8.5",
-        "controleonline/common": "1.0.5",
-        "controleonline/people": "1.0.3",
+        "controleonline/common": "^1.0.6",
+        "controleonline/people": "^1.0.9",
         "psr/log": "3.0.2"
     },
     "require-dev": {

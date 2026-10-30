@@ -163,7 +163,7 @@ final class McpServerServiceTest extends TestCase
             'method' => 'tools/call',
             'params' => [
                 'name' => 'query_business_data',
-                'arguments' => ['dataset' => 'sales', 'from' => '2026-10-02', 'company_id' => 12, 'company_role' => 'customer', 'limit' => 25],
+                'arguments' => ['dataset' => 'sales', 'from' => '2026-10-02', 'company_id' => 12, 'company_role' => 'customer', 'record_id' => 73230, 'limit' => 25, 'offset' => 50],
             ],
         ]);
 
@@ -171,7 +171,10 @@ final class McpServerServiceTest extends TestCase
         self::assertSame('sales', $queryProvider->received[0]);
         self::assertSame(12, $queryProvider->received[1]['company_id']);
         self::assertSame(25, $queryProvider->received[1]['limit']);
+        self::assertSame(73230, $queryProvider->received[1]['record_id']);
+        self::assertSame(50, $queryProvider->received[1]['offset']);
         self::assertSame(125.5, $data['rows'][0]['total']);
+        self::assertFalse($data['has_more']);
         self::assertArrayNotHasKey('document', $data['rows'][0]);
 
         $summary = $service->handle([
@@ -306,4 +309,95 @@ final class McpServerServiceTest extends TestCase
         $this->assertArrayHasKey('error', $response);
         $this->assertSame(-32601, $response['error']['code']);
     }
+
+    public function testLinkedInToolsAppearWhenProviderIsRegistered(): void
+    {
+        $linkedIn = new class implements \ControleOnline\Service\McpLinkedInProviderInterface {
+            public function getStatus(int $companyId): array
+            {
+                return ['connected' => true, 'company_id' => $companyId];
+            }
+
+            public function createPost(int $companyId, string $text): array
+            {
+                return ['success' => true, 'post_id' => 'urn:li:share:1', 'company_id' => $companyId, 'text' => $text];
+            }
+            public function getProfile(int $companyId): array { return ['company_id' => $companyId]; }
+            public function listOrganizations(int $companyId): array { return ['company_id' => $companyId]; }
+            public function createOrganizationPost(int $companyId, string $organizationUrn, string $text): array { return ['company_id' => $companyId]; }
+            public function getCapabilities(int $companyId): array { return ['company_id' => $companyId]; }
+        };
+        $tools = new \ControleOnline\Service\McpBusinessTools(
+            writeProvider: $this->createStub(\ControleOnline\Service\McpWriteOperationProviderInterface::class),
+            linkedInProvider: $linkedIn,
+        );
+        $service = new McpServerService(false, null, $tools);
+        $names = array_column($service->handle([
+            'jsonrpc' => '2.0', 'id' => 9, 'method' => 'tools/list',
+        ])['result']['tools'], 'name');
+        $this->assertContains('linkedin_status', $names);
+        $this->assertContains('linkedin_create_post', $names);
+
+        $status = $service->handle([
+            'jsonrpc' => '2.0',
+            'id' => 10,
+            'method' => 'tools/call',
+            'params' => ['name' => 'linkedin_status', 'arguments' => ['company_id' => 1]],
+        ]);
+        $this->assertArrayHasKey('result', $status);
+        $payload = json_decode($status['result']['content'][0]['text'], true);
+        $this->assertTrue($payload['connected']);
+    }
+
+    public function testBothIntegrationsPreserveScopedQueryContractAndReadOnlyPolicy(): void
+    {
+        $tools = new \ControleOnline\Service\McpBusinessTools(
+            linkedInProvider: $this->createStub(\ControleOnline\Service\McpLinkedInProviderInterface::class),
+            mercadoLivreProvider: $this->createStub(\ControleOnline\Service\McpMercadoLivreProviderInterface::class),
+        );
+        $service = new McpServerService(true, null, $tools);
+        $listed = $service->handle(['jsonrpc' => '2.0', 'id' => 30, 'method' => 'tools/list']);
+        $definitions = array_column($listed['result']['tools'], null, 'name');
+        self::assertArrayHasKey('linkedin_status', $definitions);
+        self::assertArrayHasKey('mercadolivre_status', $definitions);
+        self::assertArrayHasKey('record_id', $definitions['query_business_data']['inputSchema']['properties']);
+        self::assertArrayHasKey('offset', $definitions['query_business_data']['inputSchema']['properties']);
+        foreach (['write_business_data', 'linkedin_create_post', 'linkedin_create_organization_post', 'mercadolivre_import_products'] as $name) {
+            self::assertArrayNotHasKey($name, $definitions);
+            $response = $service->handle([
+                'jsonrpc' => '2.0', 'id' => 31, 'method' => 'tools/call',
+                'params' => ['name' => $name, 'arguments' => ['company_id' => 3]],
+            ]);
+            self::assertSame('Write operations are disabled', $response['error']['message']);
+        }
+    }
+
+    public function testMercadoLivreToolsAreRegisteredAndProviderIsCalled(): void
+    {
+        $provider = new class implements \ControleOnline\Service\McpMercadoLivreProviderInterface {
+            public function getStatus(int $companyId): array { return ['company_id' => $companyId, 'connected' => true]; }
+            public function getCurrentUser(int $companyId): array { return ['company_id' => $companyId, 'id' => 'seller-1']; }
+            public function searchItems(int $companyId, int $offset = 0, int $limit = 50): array { return ['company_id' => $companyId, 'results' => ['MLB123']]; }
+            public function getItem(int $companyId, string $itemId): array { return ['company_id' => $companyId, 'id' => $itemId]; }
+            public function getItemDescription(int $companyId, string $itemId): array { return ['company_id' => $companyId, 'item_id' => $itemId]; }
+            public function getCategory(int $companyId, string $categoryId): array { return ['company_id' => $companyId, 'id' => $categoryId]; }
+            public function getOrder(int $companyId, string $orderId): array { return ['company_id' => $companyId, 'id' => $orderId]; }
+            public function importProducts(int $companyId, int $showcaseId, int $limit = 50): array { return ['company_id' => $companyId, 'showcase_id' => $showcaseId]; }
+        };
+        $tools = new \ControleOnline\Service\McpBusinessTools(mercadoLivreProvider: $provider);
+        $service = new McpServerService(true, null, $tools);
+        $listed = $service->handle(['jsonrpc' => '2.0', 'id' => 20, 'method' => 'tools/list']);
+        $names = array_column($listed['result']['tools'], 'name');
+        self::assertContains('mercadolivre_status', $names);
+        self::assertContains('mercadolivre_get_item', $names);
+        self::assertNotContains('mercadolivre_import_products', $names);
+
+        $response = $service->handle([
+            'jsonrpc' => '2.0', 'id' => 21, 'method' => 'tools/call',
+            'params' => ['name' => 'mercadolivre_status', 'arguments' => ['company_id' => 42]],
+        ]);
+        self::assertArrayHasKey('result', $response);
+        self::assertSame(['company_id' => 42, 'connected' => true], json_decode($response['result']['content'][0]['text'], true));
+    }
+
 }

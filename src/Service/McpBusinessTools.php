@@ -6,6 +6,7 @@ namespace ControleOnline\Service;
 
 final class McpBusinessTools
 {
+    use McpLinkedInTools;
     private const DATASETS = [
         'sales', 'orders', 'invoices', 'products', 'inventory', 'wallets',
         'employees', 'clients', 'suppliers', 'salespeople', 'commissions',
@@ -15,12 +16,49 @@ final class McpBusinessTools
     public function __construct(
         private readonly ?McpReadQueryProviderInterface $provider = null,
         private readonly ?McpWriteOperationProviderInterface $writeProvider = null,
+        private readonly ?McpLinkedInProviderInterface $linkedInProvider = null,
+        private readonly ?McpMercadoLivreProviderInterface $mercadoLivreProvider = null,
     ) {
     }
 
     public function canWrite(): bool
     {
         return $this->writeProvider !== null;
+    }
+
+    public function canMercadoLivre(): bool
+    {
+        return $this->mercadoLivreProvider !== null;
+    }
+
+    /** @return list<array<string, mixed>> */
+    public static function mercadoLivreDefinitions(bool $includeWrite = true): array
+    {
+        $company = ['company_id' => ['type' => 'integer', 'minimum' => 1]];
+        $specs = [
+            ['mercadolivre_status', 'Returns the connected Mercado Livre status without exposing tokens.', $company, ['company_id']],
+            ['mercadolivre_get_current_user', 'Reads the connected Mercado Livre seller identity.', $company, ['company_id']],
+            ['mercadolivre_search_items', 'Lists item ids for the connected seller with offset pagination.', $company + ['offset' => ['type' => 'integer', 'minimum' => 0], 'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100]], ['company_id']],
+            ['mercadolivre_get_item', 'Reads a Mercado Livre listing by item id.', $company + ['item_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'item_id']],
+            ['mercadolivre_get_item_description', 'Reads a Mercado Livre listing description.', $company + ['item_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'item_id']],
+            ['mercadolivre_get_category', 'Reads Mercado Livre category metadata.', $company + ['category_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'category_id']],
+            ['mercadolivre_get_order', 'Reads an order visible to the connected seller.', $company + ['order_id' => ['type' => 'string', 'minLength' => 1]], ['company_id', 'order_id']],
+        ];
+        $definitions = [];
+        foreach ($specs as [$name, $description, $properties, $required]) {
+            $definitions[] = ['name' => $name, 'description' => $description, 'inputSchema' => [
+                'type' => 'object', 'properties' => $properties, 'required' => $required, 'additionalProperties' => false,
+            ]];
+        }
+        if ($includeWrite) {
+            $definitions[] = ['name' => 'mercadolivre_import_products',
+                'description' => 'Imports or updates products from the connected Mercado Livre seller into the selected local showcase. Does not publish or edit remote listings.',
+                'inputSchema' => ['type' => 'object', 'properties' => $company + [
+                    'showcase_id' => ['type' => 'integer', 'minimum' => 1],
+                    'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100],
+                ], 'required' => ['company_id', 'showcase_id'], 'additionalProperties' => false]];
+        }
+        return $definitions;
     }
 
     /** @return list<array<string, mixed>> */
@@ -34,7 +72,7 @@ final class McpBusinessTools
             ],
             [
                 'name' => 'query_business_data',
-                'description' => 'Use this tool to retrieve business data, not only metadata. First call list_my_companies to resolve the company, then query the chosen dataset with that company_id. Always set from and to for a time-based question. Set aggregate=true to get database-computed counts and sums without loading detail rows; optionally pass group_by to split the result by an allowed dimension. Use employees, clients, suppliers, and salespeople for linked people; use commissions for salesperson rates the user is authorized to manage. Use configs and devices for device setup metadata, displays for production screens, and production_queue for preparation status. A request only returns data for companies this user can access in the current tenant.',
+                'description' => 'Retrieve complete business records and relationships allowed for the authenticated user. Orders, sales, and invoices include linked counterparties and their details; linked people are returned only when authorized through an in-scope order/invoice or an enabled people_link. Use record_id to retrieve a specific order (for example an order number) while the API still applies securityFilter and company scope. Use limit and offset to page through all rows until has_more is false. Set from/to for time-based questions. Set aggregate=true for database-computed summaries. Every query is restricted to companies this user can access in the current tenant; API keys, passwords, credentials, tokens, and charge capabilities are removed.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
@@ -43,6 +81,7 @@ final class McpBusinessTools
                         'to' => ['type' => 'string', 'description' => 'Optional inclusive end date (YYYY-MM-DD).'],
                         'company_id' => ['type' => 'integer', 'minimum' => 1],
                         'company_role' => ['type' => 'string', 'enum' => ['customer', 'supplier', 'payer', 'receiver']],
+                        'record_id' => ['type' => 'integer', 'minimum' => 1, 'description' => 'Exact record ID filter, especially useful for looking up a specific order or invoice. It never bypasses company or security filters.'],
                         'aggregate' => ['type' => 'boolean', 'description' => 'Return database-computed counts and applicable sums instead of individual rows.'],
                         'group_by' => [
                             'type' => 'array',
@@ -52,6 +91,7 @@ final class McpBusinessTools
                             'maxItems' => 3,
                         ],
                         'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100],
+                        'offset' => ['type' => 'integer', 'minimum' => 0, 'description' => 'Pagination offset. Continue increasing it by limit while has_more is true.'],
                     ],
                     'required' => ['dataset'],
                     'additionalProperties' => false,
@@ -115,15 +155,27 @@ final class McpBusinessTools
         return $definitions;
     }
 
-    /** @param array<string, mixed> $arguments
-     *  @return array<string, mixed>
-     */
+
     public function call(string $name, array $arguments): array
     {
         return match ($name) {
             'list_query_datasets' => $this->listDatasets(),
             'query_business_data' => $this->queryBusinessData($arguments),
             'write_business_data' => $this->writeBusinessData($arguments),
+            'linkedin_status' => $this->linkedinStatus($arguments),
+            'linkedin_create_post' => $this->linkedinCreatePost($arguments),
+            'linkedin_capabilities' => $this->linkedinCapabilities($arguments),
+            'linkedin_get_profile' => $this->linkedinGetProfile($arguments),
+            'linkedin_list_organizations' => $this->linkedinListOrganizations($arguments),
+            'linkedin_create_organization_post' => $this->linkedinCreateOrganizationPost($arguments),
+            'mercadolivre_status' => $this->mercadoLivreStatus($arguments),
+            'mercadolivre_get_current_user' => $this->mercadoLivreSimpleCall($arguments, fn (int $id): array => $this->mercadoLivre()->getCurrentUser($id)),
+            'mercadolivre_search_items' => $this->mercadoLivreSearchItems($arguments),
+            'mercadolivre_get_item' => $this->mercadoLivreResource($arguments, 'item_id', fn (int $id, string $key): array => $this->mercadoLivre()->getItem($id, $key)),
+            'mercadolivre_get_item_description' => $this->mercadoLivreResource($arguments, 'item_id', fn (int $id, string $key): array => $this->mercadoLivre()->getItemDescription($id, $key)),
+            'mercadolivre_get_category' => $this->mercadoLivreResource($arguments, 'category_id', fn (int $id, string $key): array => $this->mercadoLivre()->getCategory($id, $key)),
+            'mercadolivre_get_order' => $this->mercadoLivreResource($arguments, 'order_id', fn (int $id, string $key): array => $this->mercadoLivre()->getOrder($id, $key)),
+            'mercadolivre_import_products' => $this->mercadoLivreImportProducts($arguments),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
     }
@@ -131,6 +183,59 @@ final class McpBusinessTools
     /** @param array<string, mixed> $arguments
      *  @return array<string, mixed>
      */
+    private function mercadoLivre(): McpMercadoLivreProviderInterface
+    {
+        return $this->mercadoLivreProvider ?? throw new \RuntimeException('Mercado Livre tools are not configured');
+    }
+
+    private function mercadoLivreCompanyId(array $arguments): int
+    {
+        $id = $arguments['company_id'] ?? null;
+        if (!is_int($id) || $id < 1) {
+            throw new \InvalidArgumentException('company_id is required');
+        }
+        return $id;
+    }
+
+    private function mercadoLivreStatus(array $arguments): array
+    {
+        return $this->mercadoLivre()->getStatus($this->mercadoLivreCompanyId($arguments));
+    }
+
+    private function mercadoLivreSimpleCall(array $arguments, callable $callback): array
+    {
+        return $callback($this->mercadoLivreCompanyId($arguments));
+    }
+
+    private function mercadoLivreResource(array $arguments, string $field, callable $callback): array
+    {
+        $id = $arguments[$field] ?? null;
+        if (!is_string($id) || trim($id) === '' || strlen($id) > 128) {
+            throw new \InvalidArgumentException($field . ' is required');
+        }
+        return $callback($this->mercadoLivreCompanyId($arguments), trim($id));
+    }
+
+    private function mercadoLivreSearchItems(array $arguments): array
+    {
+        $offset = $arguments['offset'] ?? 0;
+        $limit = $arguments['limit'] ?? 50;
+        if (!is_int($offset) || $offset < 0 || !is_int($limit) || $limit < 1 || $limit > 100) {
+            throw new \InvalidArgumentException('offset/limit are invalid');
+        }
+        return $this->mercadoLivre()->searchItems($this->mercadoLivreCompanyId($arguments), $offset, $limit);
+    }
+
+    private function mercadoLivreImportProducts(array $arguments): array
+    {
+        $showcaseId = $arguments['showcase_id'] ?? null;
+        $limit = $arguments['limit'] ?? 50;
+        if (!is_int($showcaseId) || $showcaseId < 1 || !is_int($limit) || $limit < 1 || $limit > 100) {
+            throw new \InvalidArgumentException('showcase_id and limit are invalid');
+        }
+        return $this->mercadoLivre()->importProducts($this->mercadoLivreCompanyId($arguments), $showcaseId, $limit);
+    }
+
     private function writeBusinessData(array $arguments): array
     {
         $operation = $arguments['operation'] ?? null;
@@ -139,6 +244,7 @@ final class McpBusinessTools
         if (!is_string($operation) || !in_array($operation, ['upsert_company_config', 'create_product', 'update_product', 'create_stock_order'], true)) {
             throw new \InvalidArgumentException('Unsupported write operation');
         }
+
         if (!is_int($companyId) || $companyId < 1 || !is_array($payload)) {
             throw new \InvalidArgumentException('company_id and payload are required');
         }
@@ -184,6 +290,14 @@ final class McpBusinessTools
         $companyId = $arguments['company_id'] ?? null;
         if ($companyId !== null && (!is_int($companyId) || $companyId < 1)) {
             throw new \InvalidArgumentException('company_id must be a positive integer');
+        }
+
+        $recordId = $arguments['record_id'] ?? null;
+        if ($recordId !== null && (!is_int($recordId) || $recordId < 1)) {
+            throw new \InvalidArgumentException('record_id must be a positive integer');
+        }
+        if ($recordId !== null && !in_array($dataset, ['sales', 'orders', 'invoices', 'products'], true)) {
+            throw new \InvalidArgumentException('record_id is not supported for this dataset');
         }
 
         $companyRole = $arguments['company_role'] ?? null;
@@ -238,15 +352,21 @@ final class McpBusinessTools
         if (!is_int($limit) || $limit < 1 || $limit > 100) {
             throw new \InvalidArgumentException('limit must be between 1 and 100');
         }
+        $offset = $arguments['offset'] ?? 0;
+        if (!is_int($offset) || $offset < 0 || $offset > 1000000) {
+            throw new \InvalidArgumentException('offset must be between 0 and 1000000');
+        }
 
         $rows = $this->provider()->query($dataset, [
             'from' => $arguments['from'] ?? null,
             'to' => $arguments['to'] ?? null,
             'company_id' => $companyId,
             'company_role' => $companyRole,
+            'record_id' => $recordId,
             'aggregate' => $aggregate,
             'group_by' => $groupBy,
             'limit' => $limit,
+            'offset' => $offset,
         ]);
 
         if ($aggregate) {
@@ -260,7 +380,7 @@ final class McpBusinessTools
                 : []);
         }
 
-        return ['dataset' => $dataset, 'count' => count($rows), 'rows' => $rows] + ($rows === []
+        return ['dataset' => $dataset, 'count' => count($rows), 'rows' => $rows, 'limit' => $limit, 'offset' => $offset, 'has_more' => count($rows) === $limit, 'next_offset' => $offset + count($rows)] + ($rows === []
             ? ['hint' => 'No rows matched. Confirm the date range and choose an accessible company from list_my_companies.']
             : []);
     }
@@ -273,4 +393,5 @@ final class McpBusinessTools
 
         return $this->provider;
     }
+
 }
