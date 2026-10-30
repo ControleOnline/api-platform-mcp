@@ -6,6 +6,7 @@ namespace ControleOnline\Service;
 
 final class McpBusinessTools
 {
+    use McpLinkedInTools;
     private const DATASETS = [
         'sales', 'orders', 'invoices', 'products', 'inventory', 'wallets',
         'employees', 'clients', 'suppliers', 'salespeople', 'commissions',
@@ -15,6 +16,7 @@ final class McpBusinessTools
     public function __construct(
         private readonly ?McpReadQueryProviderInterface $provider = null,
         private readonly ?McpWriteOperationProviderInterface $writeProvider = null,
+        private readonly ?McpLinkedInProviderInterface $linkedInProvider = null,
         private readonly ?McpMercadoLivreProviderInterface $mercadoLivreProvider = null,
     ) {
     }
@@ -153,15 +155,19 @@ final class McpBusinessTools
         return $definitions;
     }
 
-    /** @param array<string, mixed> $arguments
-     *  @return array<string, mixed>
-     */
+
     public function call(string $name, array $arguments): array
     {
         return match ($name) {
             'list_query_datasets' => $this->listDatasets(),
             'query_business_data' => $this->queryBusinessData($arguments),
             'write_business_data' => $this->writeBusinessData($arguments),
+            'linkedin_status' => $this->linkedinStatus($arguments),
+            'linkedin_create_post' => $this->linkedinCreatePost($arguments),
+            'linkedin_capabilities' => $this->linkedinCapabilities($arguments),
+            'linkedin_get_profile' => $this->linkedinGetProfile($arguments),
+            'linkedin_list_organizations' => $this->linkedinListOrganizations($arguments),
+            'linkedin_create_organization_post' => $this->linkedinCreateOrganizationPost($arguments),
             'mercadolivre_status' => $this->mercadoLivreStatus($arguments),
             'mercadolivre_get_current_user' => $this->mercadoLivreSimpleCall($arguments, fn (int $id): array => $this->mercadoLivre()->getCurrentUser($id)),
             'mercadolivre_search_items' => $this->mercadoLivreSearchItems($arguments),
@@ -387,4 +393,5 @@ final class McpBusinessTools
 
         return $this->provider;
     }
+
 }

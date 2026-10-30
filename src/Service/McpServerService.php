@@ -147,6 +147,9 @@ class McpServerService
                     ],
                 ],
                 ...McpBusinessTools::definitions(!$this->isReadOnly()),
+                ...($this->businessTools?->canLinkedIn()
+                    ? McpBusinessTools::linkedInDefinitions(!$this->isReadOnly())
+                    : []),
                 ...($this->businessTools?->canMercadoLivre()
                     ? McpBusinessTools::mercadoLivreDefinitions(!$this->isReadOnly())
                     : []),
@@ -176,7 +179,7 @@ class McpServerService
             throw new \InvalidArgumentException('Tool name is required');
         }
 
-        if (in_array($name, ['write_business_data', 'mercadolivre_import_products'], true) && $this->isReadOnly()) {
+        if (in_array($name, ['write_business_data', 'linkedin_create_post', 'linkedin_create_organization_post', 'mercadolivre_import_products'], true) && $this->isReadOnly()) {
             throw new \InvalidArgumentException('Write operations are disabled');
         }
 
@@ -189,7 +192,9 @@ class McpServerService
                 'time' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format(\DateTimeInterface::ATOM),
             ],
             'list_my_companies' => $this->listMyCompanies(),
-            'list_query_datasets', 'query_business_data' => $this->businessTools?->call((string) $name, $arguments),
+            'list_query_datasets', 'query_business_data', 'write_business_data',
+            'linkedin_status', 'linkedin_create_post', 'linkedin_capabilities', 'linkedin_get_profile',
+            'linkedin_list_organizations', 'linkedin_create_organization_post',
             'mercadolivre_status', 'mercadolivre_get_current_user', 'mercadolivre_search_items',
             'mercadolivre_get_item', 'mercadolivre_get_item_description', 'mercadolivre_get_category',
             'mercadolivre_get_order', 'mercadolivre_import_products' => $this->businessTools?->call((string) $name, $arguments)
