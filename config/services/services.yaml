@@ -25,3 +25,10 @@ services:
 
     ControleOnline\Controller\McpController:
         tags: ['controller.service_arguments']
+
+    ControleOnline\Controller\McpChatController:
+        tags: ['controller.service_arguments']
+
+    ControleOnline\Service\McpChatOrchestratorService:
+        autowire: true
+        autoconfigure: true
