@@ -28,8 +28,8 @@ services:
 
     # Chat MCP (Task type=ia) — provider keys via env MCP_AI_PROVIDERS JSON
     ControleOnline\Service\McpChatService:
-        arguments:
-            $providersConfig: '%env(default::MCP_AI_PROVIDERS)%'
+        autowire: true
+        autoconfigure: true
 
     ControleOnline\Controller\McpChatController:
         tags: ['controller.service_arguments']
