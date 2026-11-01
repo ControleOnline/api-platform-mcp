@@ -26,9 +26,10 @@ services:
     ControleOnline\Controller\McpController:
         tags: ['controller.service_arguments']
 
-    ControleOnline\Controller\McpChatController:
-        tags: ['controller.service_arguments']
-
-    ControleOnline\Service\McpChatOrchestratorService:
+    # Chat MCP (Task type=ia) — provider keys via env MCP_AI_PROVIDERS JSON
+    ControleOnline\Service\McpChatService:
         autowire: true
         autoconfigure: true
+
+    ControleOnline\Controller\McpChatController:
+        tags: ['controller.service_arguments']
