@@ -282,6 +282,15 @@ private function resolveCompany(?int $companyId): People
             if ($task->getType() !== 'ia') {
                 throw new \InvalidArgumentException('task is not type=ia');
             }
+            $taskProvider = $task->getProvider();
+            if (!$taskProvider instanceof People || (int) $taskProvider->getId() !== (int) $company->getId()) {
+                throw new \InvalidArgumentException('task_id not in company scope');
+            }
+            // Private IA chats: only the creator (or company people acting as bot) may continue.
+            $owner = $task->getRegisteredBy();
+            if ($owner instanceof People && (int) $owner->getId() !== (int) $user->getId()) {
+                throw new \InvalidArgumentException('task_id not owned by current user');
+            }
 
             return $task;
         }
