@@ -10,8 +10,6 @@ use ControleOnline\Entity\Task;
 use ControleOnline\Entity\TaskInteration;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
-use Symfony\Component\DependencyInjection\Attribute\Autowire;
-
 /**
  * Orchestrates MCP chat sessions persisted as Task(type=ia) + TaskInteration.
  * LLM provider keys stay server-side; tool calls go through McpServerService.
@@ -23,7 +21,6 @@ class McpChatService
         private readonly Security $security,
         private readonly McpServerService $mcpServer,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
-        #[Autowire('%env(default::json:MCP_AI_PROVIDERS)%')]
         private readonly mixed $providersConfig = null,
     ) {
     }
