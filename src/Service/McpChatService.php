@@ -150,6 +150,7 @@ class McpChatService
                 'model' => (string) ($incoming['model'] ?? $def['model']),
                 'base_url' => (string) ($incoming['base_url'] ?? $def['base_url']),
                 'api_key' => $apiKey,
+                'system_prompt' => (string) ($incoming['system_prompt'] ?? $prev['system_prompt'] ?? ''),
             ];
         }
         $row = $this->findConfigRow($company);
@@ -370,7 +371,9 @@ private function resolveCompany(?int $companyId): People
             $mcpContext = '{}';
         }
 
-        $system = "You are the ControleOnline company assistant. Answer using MCP business data only. "
+        $custom = trim((string) ($providerConfig['system_prompt'] ?? ''));
+        $system = ($custom !== '' ? $custom . "\n\n" : "")
+            . "You are the ControleOnline company assistant. Answer using MCP business data only. "
             . "Companies in scope (JSON): {$mcpContext}. "
             . "If you need numbers, say what query would be required. Reply in the user language.";
 
