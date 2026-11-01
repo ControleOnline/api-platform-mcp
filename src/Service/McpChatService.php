@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ControleOnline\Service;
 
+use ControleOnline\Entity\Config;
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Status;
 use ControleOnline\Entity\Task;
@@ -16,12 +17,13 @@ use Symfony\Bundle\SecurityBundle\Security;
  */
 class McpChatService
 {
+    public const CONFIG_KEY = 'ai-providers';
+
     public function __construct(
         private readonly EntityManagerInterface $em,
         private readonly Security $security,
         private readonly McpServerService $mcpServer,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
-        private readonly mixed $providersConfig = null,
     ) {
     }
 
@@ -41,13 +43,12 @@ class McpChatService
             throw new \RuntimeException('Authenticated People user required');
         }
 
-        $aiProvider = strtolower((string) ($input['provider'] ?? 'grok'));
-        $providerConfig = $this->resolveProviderConfig($aiProvider);
-        if ($providerConfig === null) {
-            throw new \InvalidArgumentException("AI provider not configured or disabled: {$aiProvider}");
-        }
-
         $company = $this->resolveCompany($input['company_id'] ?? null);
+        $aiProvider = strtolower((string) ($input['provider'] ?? 'grok'));
+        $providerConfig = $this->resolveProviderConfig($company, $aiProvider);
+        if ($providerConfig === null) {
+            throw new \InvalidArgumentException("AI provider not configured or disabled for this company: {$aiProvider}");
+        }
         $task = $this->resolveOrCreateTask(
             isset($input['task_id']) ? (int) $input['task_id'] : null,
             $user,
@@ -80,14 +81,12 @@ class McpChatService
     /**
      * @return list<array{provider: string, label: string, model: string, enabled: bool}>
      */
-    public function listConfiguredProviders(): array
+    public function listConfiguredProviders(?int $companyId = null): array
     {
+        $company = $this->resolveCompany($companyId);
         $out = [];
-        foreach ($this->normalizedProviders() as $key => $cfg) {
-            if (!($cfg['enabled'] ?? false)) {
-                continue;
-            }
-            if (empty($cfg['api_key'])) {
+        foreach ($this->loadProvidersFromConfig($company) as $key => $cfg) {
+            if (!($cfg['enabled'] ?? false) || empty($cfg['api_key'])) {
                 continue;
             }
             $out[] = [
@@ -95,18 +94,85 @@ class McpChatService
                 'label' => (string) ($cfg['label'] ?? $key),
                 'model' => (string) ($cfg['model'] ?? ''),
                 'enabled' => true,
+                'has_key' => true,
+                'api_key_masked' => $this->maskKey((string) $cfg['api_key']),
             ];
         }
 
         return $out;
     }
 
+    /** @return array{company_id: int, config_id: int|null, config_key: string, providers: array<string, mixed>} */
+    public function getProvidersConfigForUi(?int $companyId = null): array
+    {
+        $company = $this->resolveCompany($companyId);
+        $row = $this->findConfigRow($company);
+        $masked = [];
+        foreach ($this->loadProvidersFromConfig($company) as $key => $cfg) {
+            $keyVal = (string) ($cfg['api_key'] ?? '');
+            $masked[$key] = [
+                'label' => $cfg['label'] ?? $key,
+                'enabled' => (bool) ($cfg['enabled'] ?? false),
+                'model' => (string) ($cfg['model'] ?? ''),
+                'base_url' => (string) ($cfg['base_url'] ?? ''),
+                'has_key' => $keyVal !== '',
+                'api_key_masked' => $keyVal !== '' ? $this->maskKey($keyVal) : null,
+            ];
+        }
+
+        return [
+            'company_id' => $company->getId(),
+            'config_id' => $row?->getId(),
+            'config_key' => self::CONFIG_KEY,
+            'providers' => $masked,
+        ];
+    }
+
+    /**
+     * @param array<string, array<string, mixed>> $providers
+     * @return array{config_id: int}
+     */
+    public function saveProvidersConfig(array $providers, ?int $companyId = null): array
+    {
+        $company = $this->resolveCompany($companyId);
+        $existing = $this->loadProvidersFromConfig($company);
+        $merged = [];
+        foreach ($this->defaultProviders() as $key => $def) {
+            $incoming = is_array($providers[$key] ?? null) ? $providers[$key] : [];
+            $prev = $existing[$key] ?? [];
+            $apiKey = trim((string) ($incoming['api_key'] ?? ''));
+            if ($apiKey === '' || str_contains($apiKey, '*')) {
+                $apiKey = (string) ($prev['api_key'] ?? '');
+            }
+            $merged[$key] = [
+                'label' => (string) ($incoming['label'] ?? $def['label']),
+                'enabled' => (bool) ($incoming['enabled'] ?? false),
+                'model' => (string) ($incoming['model'] ?? $def['model']),
+                'base_url' => (string) ($incoming['base_url'] ?? $def['base_url']),
+                'api_key' => $apiKey,
+            ];
+        }
+        $row = $this->findConfigRow($company);
+        if ($row === null) {
+            $row = new Config();
+            $row->setPeople($company);
+            $row->setConfigKey(self::CONFIG_KEY);
+            $row->setVisibility('private');
+            $this->em->persist($row);
+        }
+        $row->setConfigValue(json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        $this->em->flush();
+
+        return ['config_id' => $row->getId()];
+    }
+
     /**
      * @return array<string, mixed>|null
      */
-    private function resolveProviderConfig(string $key): ?array
+    
+    private function resolveProviderConfig(People $company, string $key): ?array
     {
-        $all = $this->normalizedProviders();
+        $all = $this->loadProvidersFromConfig($company);
         $cfg = $all[$key] ?? null;
         if (!is_array($cfg) || !($cfg['enabled'] ?? false) || empty($cfg['api_key'])) {
             return null;
@@ -115,37 +181,59 @@ class McpChatService
         return $cfg;
     }
 
-    /**
-     * @return array<string, array<string, mixed>>
-     */
-    private function normalizedProviders(): array
+    /** @return array<string, array<string, mixed>> */
+    private function defaultProviders(): array
     {
-        $raw = $this->providersConfig;
-        if (is_string($raw) && $raw !== '') {
-            $decoded = json_decode($raw, true);
-            $raw = is_array($decoded) ? $decoded : [];
-        }
-        if (!is_array($raw)) {
-            return [];
-        }
-
-        $defaults = [
+        return [
             'grok' => ['label' => 'Grok', 'base_url' => 'https://api.x.ai/v1', 'model' => 'grok-4'],
             'openai' => ['label' => 'Codex / OpenAI', 'base_url' => 'https://api.openai.com/v1', 'model' => 'gpt-4o'],
             'gemini' => ['label' => 'Gemini', 'base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'gemini-2.0-flash'],
             'claude' => ['label' => 'Claude', 'base_url' => 'https://api.anthropic.com/v1', 'model' => 'claude-sonnet-4'],
         ];
+    }
 
+    private function findConfigRow(People $company): ?Config
+    {
+        $row = $this->em->getRepository(Config::class)->findOneBy([
+            'people' => $company,
+            'configKey' => self::CONFIG_KEY,
+        ]);
+
+        return $row instanceof Config ? $row : null;
+    }
+
+    /** @return array<string, array<string, mixed>> */
+    private function loadProvidersFromConfig(People $company): array
+    {
+        $defaults = $this->defaultProviders();
+        $row = $this->findConfigRow($company);
+        $raw = [];
+        if ($row !== null) {
+            $decoded = json_decode($row->getConfigValue(), true);
+            if (is_array($decoded)) {
+                $raw = $decoded;
+            }
+        }
         $out = [];
         foreach ($defaults as $key => $def) {
             $cfg = is_array($raw[$key] ?? null) ? $raw[$key] : [];
-            $out[$key] = array_merge($def, $cfg, ['enabled' => (bool) ($cfg['enabled'] ?? false)]);
+            $out[$key] = array_merge($def, $cfg);
         }
 
         return $out;
     }
 
-    private function resolveCompany(?int $companyId): People
+    private function maskKey(string $key): string
+    {
+        $len = strlen($key);
+        if ($len <= 8) {
+            return str_repeat('*', $len);
+        }
+
+        return substr($key, 0, 4) . str_repeat('*', max(4, $len - 8)) . substr($key, -4);
+    }
+
+private function resolveCompany(?int $companyId): People
     {
         if ($companyId !== null && $companyId > 0) {
             $company = $this->em->getRepository(People::class)->find($companyId);
