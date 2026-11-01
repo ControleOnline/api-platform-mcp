@@ -115,6 +115,7 @@ class McpChatService
                 'enabled' => (bool) ($cfg['enabled'] ?? false),
                 'model' => (string) ($cfg['model'] ?? ''),
                 'base_url' => (string) ($cfg['base_url'] ?? ''),
+                'system_prompt' => (string) ($cfg['system_prompt'] ?? ''),
                 'has_key' => $keyVal !== '',
                 'api_key_masked' => $keyVal !== '' ? $this->maskKey($keyVal) : null,
             ];
