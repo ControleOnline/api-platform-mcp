@@ -35,10 +35,52 @@ class McpChatController
         }
 
         return new JsonResponse(
-            ['providers' => $this->chatService->listConfiguredProviders()],
+            (function () use ($request) {
+                $companyId = $request->query->get('company_id');
+                $cid = is_numeric($companyId) ? (int) $companyId : null;
+                return ['providers' => $this->chatService->listConfiguredProviders($cid)];
+            })(),
             Response::HTTP_OK,
             $this->corsHeaders()
         );
+    }
+
+
+    #[Route('/chat/config', name: 'controleonline_mcp_chat_config_get', methods: ['GET', 'OPTIONS'])]
+    public function getConfig(Request $request): Response
+    {
+        if ($request->getMethod() === 'OPTIONS') {
+            return new Response('', Response::HTTP_NO_CONTENT, $this->corsHeaders());
+        }
+        if (!$this->authorizationChecker->isGranted('ROLE_HUMAN')) {
+            return new JsonResponse(['error' => 'Authentication required'], Response::HTTP_UNAUTHORIZED, $this->corsHeaders());
+        }
+        $companyId = $request->query->get('company_id');
+        $cid = is_numeric($companyId) ? (int) $companyId : null;
+        try {
+            return new JsonResponse($this->chatService->getProvidersConfigForUi($cid), Response::HTTP_OK, $this->corsHeaders());
+        } catch (\Throwable $e) {
+            return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+    }
+
+    #[Route('/chat/config', name: 'controleonline_mcp_chat_config_put', methods: ['PUT', 'POST'])]
+    public function saveConfig(Request $request): Response
+    {
+        if (!$this->authorizationChecker->isGranted('ROLE_HUMAN')) {
+            return new JsonResponse(['error' => 'Authentication required'], Response::HTTP_UNAUTHORIZED, $this->corsHeaders());
+        }
+        $payload = json_decode($request->getContent() ?: '{}', true);
+        if (!is_array($payload)) {
+            return new JsonResponse(['error' => 'Invalid JSON'], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+        $providers = is_array($payload['providers'] ?? null) ? $payload['providers'] : [];
+        $cid = isset($payload['company_id']) && is_numeric($payload['company_id']) ? (int) $payload['company_id'] : null;
+        try {
+            return new JsonResponse($this->chatService->saveProvidersConfig($providers, $cid), Response::HTTP_OK, $this->corsHeaders());
+        } catch (\Throwable $e) {
+            return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
     }
 
     #[Route('/chat', name: 'controleonline_mcp_chat', methods: ['POST', 'OPTIONS'])]
@@ -71,7 +113,7 @@ class McpChatController
     {
         return [
             'Access-Control-Allow-Origin' => '*',
-            'Access-Control-Allow-Methods' => 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Methods' => 'GET, POST, PUT, OPTIONS',
             'Access-Control-Allow-Headers' => 'Content-Type, Authorization, Accept',
             'Content-Type' => 'application/json',
         ];
