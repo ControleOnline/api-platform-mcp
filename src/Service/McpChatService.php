@@ -62,7 +62,7 @@ class McpChatService
         $this->addInteraction($task, $user, 'comment', $message, 'private');
 
         $history = $this->loadHistory($task);
-        $assistantText = $this->runLlmWithMcpTools($providerConfig, $history, $message);
+        $assistantText = $this->runLlmWithMcpTools($aiProvider, $providerConfig, $history, $message);
 
         // System/AI author: reuse company people as registeredBy when no dedicated bot people exists
         $this->addInteraction($task, $company, 'comment', $assistantText, 'private');
@@ -386,7 +386,7 @@ class McpChatService
      * @param array<string, mixed> $providerConfig
      * @param list<array{role: string, content: string}> $history
      */
-    private function runLlmWithMcpTools(array $providerConfig, array $history, string $userMessage): string
+    private function runLlmWithMcpTools(string $providerKey, array $providerConfig, array $history, string $userMessage): string
     {
         // Gather MCP context for the model (companies + optional aggregate hint)
         $mcpContext = '';
@@ -408,30 +408,169 @@ class McpChatService
             . "Companies in scope (JSON): {$mcpContext}. "
             . "If you need numbers, say what query would be required. Reply in the user language.";
 
-        $messages = array_merge(
-            [['role' => 'system', 'content' => $system]],
-            array_slice($history, -12),
-            [['role' => 'user', 'content' => $userMessage]],
-        );
-
+        $historySlice = array_slice($history, -12);
         $baseUrl = rtrim((string) ($providerConfig['base_url'] ?? 'https://api.x.ai/v1'), '/');
         $model = (string) ($providerConfig['model'] ?? 'grok-4');
         $apiKey = (string) $providerConfig['api_key'];
+        $providerKey = strtolower($providerKey);
 
-        // OpenAI-compatible chat completions (Grok/OpenAI); Claude/Gemini adapters can extend later
-        $payload = json_encode([
-            'model' => $model,
-            'messages' => $messages,
-            'temperature' => 0.2,
-        ], JSON_UNESCAPED_UNICODE);
+        if ($providerKey === 'claude' || str_contains($baseUrl, 'anthropic.com')) {
+            return $this->callClaude($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
+        }
+        if ($providerKey === 'gemini' || str_contains($baseUrl, 'generativelanguage.googleapis.com')) {
+            return $this->callGemini($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
+        }
 
-        $ch = curl_init($baseUrl . '/chat/completions');
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
+        return $this->callOpenAiCompatible($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
+    }
+
+    /**
+     * @param list<array{role: string, content: string}> $historySlice
+     */
+    private function callOpenAiCompatible(
+        string $baseUrl,
+        string $model,
+        string $apiKey,
+        string $system,
+        array $historySlice,
+        string $userMessage,
+    ): string {
+        $messages = array_merge(
+            [['role' => 'system', 'content' => $system]],
+            $historySlice,
+            [['role' => 'user', 'content' => $userMessage]],
+        );
+        $decoded = $this->httpJson(
+            $baseUrl . '/chat/completions',
+            [
                 'Content-Type: application/json',
                 'Authorization: Bearer ' . $apiKey,
             ],
+            [
+                'model' => $model,
+                'messages' => $messages,
+                'temperature' => 0.2,
+            ],
+        );
+        $text = $decoded['choices'][0]['message']['content'] ?? null;
+        if (!is_string($text) || $text === '') {
+            throw new \RuntimeException('AI provider returned empty content');
+        }
+
+        return $text;
+    }
+
+    /**
+     * @param list<array{role: string, content: string}> $historySlice
+     */
+    private function callClaude(
+        string $baseUrl,
+        string $model,
+        string $apiKey,
+        string $system,
+        array $historySlice,
+        string $userMessage,
+    ): string {
+        $messages = [];
+        foreach ($historySlice as $row) {
+            $role = (string) ($row['role'] ?? '');
+            if ($role === 'system' || $role === '') {
+                continue;
+            }
+            if ($role !== 'user' && $role !== 'assistant') {
+                $role = 'user';
+            }
+            $messages[] = ['role' => $role, 'content' => (string) ($row['content'] ?? '')];
+        }
+        $messages[] = ['role' => 'user', 'content' => $userMessage];
+        $decoded = $this->httpJson(
+            $baseUrl . '/messages',
+            [
+                'Content-Type: application/json',
+                'x-api-key: ' . $apiKey,
+                'anthropic-version: 2023-06-01',
+            ],
+            [
+                'model' => $model,
+                'max_tokens' => 2048,
+                'system' => $system,
+                'messages' => $messages,
+                'temperature' => 0.2,
+            ],
+        );
+        $blocks = $decoded['content'] ?? [];
+        $text = '';
+        if (is_array($blocks)) {
+            foreach ($blocks as $block) {
+                if (is_array($block) && ($block['type'] ?? '') === 'text') {
+                    $text .= (string) ($block['text'] ?? '');
+                }
+            }
+        }
+        if ($text === '') {
+            throw new \RuntimeException('Claude returned empty content');
+        }
+
+        return $text;
+    }
+
+    /**
+     * @param list<array{role: string, content: string}> $historySlice
+     */
+    private function callGemini(
+        string $baseUrl,
+        string $model,
+        string $apiKey,
+        string $system,
+        array $historySlice,
+        string $userMessage,
+    ): string {
+        $contents = [];
+        foreach ($historySlice as $row) {
+            $role = (string) ($row['role'] ?? 'user');
+            $geminiRole = $role === 'assistant' ? 'model' : 'user';
+            $contents[] = [
+                'role' => $geminiRole,
+                'parts' => [['text' => (string) ($row['content'] ?? '')]],
+            ];
+        }
+        $contents[] = [
+            'role' => 'user',
+            'parts' => [['text' => $userMessage]],
+        ];
+        $url = rtrim($baseUrl, '/') . '/models/' . rawurlencode($model) . ':generateContent?key=' . rawurlencode($apiKey);
+        $decoded = $this->httpJson(
+            $url,
+            ['Content-Type: application/json'],
+            [
+                'systemInstruction' => ['parts' => [['text' => $system]]],
+                'contents' => $contents,
+                'generationConfig' => ['temperature' => 0.2],
+            ],
+        );
+        $text = $decoded['candidates'][0]['content']['parts'][0]['text'] ?? null;
+        if (!is_string($text) || $text === '') {
+            throw new \RuntimeException('Gemini returned empty content');
+        }
+
+        return $text;
+    }
+
+    /**
+     * @param list<string> $headers
+     * @param array<string, mixed> $body
+     * @return array<string, mixed>
+     */
+    private function httpJson(string $url, array $headers, array $body): array
+    {
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE);
+        if ($payload === false) {
+            throw new \RuntimeException('Failed to encode AI request');
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => $headers,
             CURLOPT_POSTFIELDS => $payload,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 60,
@@ -446,14 +585,10 @@ class McpChatService
         }
         $decoded = json_decode($raw, true);
         if ($status >= 400 || !is_array($decoded)) {
-            throw new \RuntimeException('AI provider error HTTP ' . $status);
+            $snippet = is_string($raw) ? mb_substr($raw, 0, 200) : '';
+            throw new \RuntimeException('AI provider error HTTP ' . $status . ($snippet !== '' ? ': ' . $snippet : ''));
         }
 
-        $text = $decoded['choices'][0]['message']['content'] ?? null;
-        if (!is_string($text) || $text === '') {
-            throw new \RuntimeException('AI provider returned empty content');
-        }
-
-        return $text;
+        return $decoded;
     }
 }
