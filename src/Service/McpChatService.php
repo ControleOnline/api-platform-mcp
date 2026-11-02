@@ -9,6 +9,7 @@ use ControleOnline\Entity\Module;
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Status;
 use ControleOnline\Entity\Task;
+use ControleOnline\Entity\User;
 use ControleOnline\Entity\TaskInteration;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
@@ -39,7 +40,14 @@ class McpChatService
             throw new \InvalidArgumentException('message is required');
         }
 
-        $user = $this->security->getUser();
+        $auth = $this->security->getUser();
+        if ($auth instanceof People) {
+            $user = $auth;
+        } elseif ($auth instanceof User) {
+            $user = $auth->getPeople();
+        } else {
+            throw new \RuntimeException('Authenticated People user required');
+        }
         if (!$user instanceof People) {
             throw new \RuntimeException('Authenticated People user required');
         }

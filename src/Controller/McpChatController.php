@@ -104,7 +104,7 @@ class McpChatController
         } catch (\InvalidArgumentException $e) {
             return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
         } catch (\Throwable $e) {
-            return new JsonResponse(['error' => 'Chat failed'], Response::HTTP_INTERNAL_SERVER_ERROR, $this->corsHeaders());
+            return new JsonResponse(['error' => 'Chat failed: ' . $e->getMessage()], Response::HTTP_INTERNAL_SERVER_ERROR, $this->corsHeaders());
         }
     }
 
