@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ControleOnline\Service;
 
 use ControleOnline\Entity\Config;
+use ControleOnline\Entity\Module;
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Status;
 use ControleOnline\Entity\Task;
@@ -160,7 +161,10 @@ class McpChatService
             $row->setPeople($company);
             $row->setConfigKey(self::CONFIG_KEY);
             $row->setVisibility('private');
+            $row->setModule($this->resolveConfigModule());
             $this->em->persist($row);
+        } elseif ($row->getModule() === null) {
+            $row->setModule($this->resolveConfigModule());
         }
         $row->setConfigValue(json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
         $this->em->flush();
@@ -235,7 +239,24 @@ class McpChatService
         return substr($key, 0, 4) . str_repeat('*', max(4, $len - 8)) . substr($key, -4);
     }
 
-private function resolveCompany(?int $companyId): People
+
+    private function resolveConfigModule(): Module
+    {
+        $repository = $this->em->getRepository(Module::class);
+        foreach (['mcp', 'config', 'common', 'ui-manager', 'financial'] as $moduleName) {
+            $module = $repository->findOneBy(['name' => $moduleName]);
+            if ($module instanceof Module) {
+                return $module;
+            }
+        }
+        $module = $repository->findOneBy([], ['id' => 'ASC']);
+        if ($module instanceof Module) {
+            return $module;
+        }
+        throw new \RuntimeException('No module available to attach ai-providers config.');
+    }
+
+    private function resolveCompany(?int $companyId): People
     {
         if ($companyId !== null && $companyId > 0) {
             $company = $this->em->getRepository(People::class)->find($companyId);
