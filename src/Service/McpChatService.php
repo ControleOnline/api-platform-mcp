@@ -11,8 +11,10 @@ use ControleOnline\Entity\Status;
 use ControleOnline\Entity\Task;
 use ControleOnline\Entity\User;
 use ControleOnline\Entity\TaskInteration;
+use ControleOnline\Entity\Integration;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
+use ControleOnline\Service\IntegrationService;
 /**
  * Orchestrates MCP chat sessions persisted as Task(type=ia) + TaskInteration.
  * LLM provider keys stay server-side; tool calls go through McpServerService.
@@ -26,6 +28,7 @@ class McpChatService
         private readonly Security $security,
         private readonly McpServerService $mcpServer,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
+        private readonly ?IntegrationService $integrationService = null,
     ) {
     }
 
@@ -67,24 +70,140 @@ class McpChatService
             $message,
         );
 
-        $this->addInteraction($task, $user, 'comment', $message, 'private');
-
-        $history = $this->loadHistory($task);
-        $assistantText = $this->runLlmWithMcpTools($aiProvider, $providerConfig, $history, $message);
-
-        // System/AI author: reuse company people as registeredBy when no dedicated bot people exists
-        $this->addInteraction($task, $company, 'comment', $assistantText, 'private');
-
-        $task->setAlterDate(new \DateTime('now'));
+        // Phase 1: persist user turn and enqueue async processing
+        $userInteraction = $this->addInteraction($task, $user, 'comment', $message, 'private', 'pending');
         $this->em->flush();
+
+        $payload = json_encode([
+            'action' => 'mcp_chat',
+            'task_id' => $task->getId(),
+            'interaction_id' => $userInteraction->getId(),
+            'provider' => $aiProvider,
+            'company_id' => $company->getId(),
+            'user_id' => $user->getId(),
+            'message' => $message,
+        ], JSON_UNESCAPED_UNICODE);
+
+        $integrationId = null;
+        if ($this->integrationService !== null) {
+            $authUser = $this->security->getUser();
+            $userEntity = $authUser instanceof User ? $authUser : null;
+            $integration = $this->integrationService->addIntegration(
+                (string) $payload,
+                'McpChat',
+                null,
+                $userEntity,
+                $company,
+            );
+            $integrationId = $integration->getId();
+        } else {
+            // Fallback sync when IntegrationService is not wired (tests)
+            $this->processQueuedChat([
+                'task_id' => $task->getId(),
+                'interaction_id' => $userInteraction->getId(),
+                'provider' => $aiProvider,
+                'company_id' => $company->getId(),
+                'message' => $message,
+            ]);
+        }
 
         return [
             'task_id' => $task->getId(),
+            'interaction_id' => $userInteraction->getId(),
+            'integration_id' => $integrationId,
             'type' => 'ia',
             'provider' => $aiProvider,
-            'message' => $assistantText,
-            'history_count' => count($history) + 2,
+            'status' => 'pending',
+            'message' => null,
+            'async' => true,
         ];
+    }
+
+    /**
+     * Integration queue handler (queueName=McpChat → ControleOnline\Service\McpChatService).
+     */
+    public function integrate(Integration $integration): void
+    {
+        $body = $integration->getBody();
+        $data = is_string($body) ? json_decode($body, true) : (is_array($body) ? $body : null);
+        if (!is_array($data)) {
+            throw new \RuntimeException('Invalid McpChat integration body');
+        }
+        $this->processQueuedChat($data);
+    }
+
+    /**
+     * Phase 2: call LLM, persist assistant turn, update statuses, push websocket.
+     *
+     * @param array<string, mixed> $data
+     */
+    public function processQueuedChat(array $data): void
+    {
+        $taskId = (int) ($data['task_id'] ?? 0);
+        $interactionId = (int) ($data['interaction_id'] ?? 0);
+        $aiProvider = strtolower((string) ($data['provider'] ?? 'grok'));
+        $companyId = isset($data['company_id']) ? (int) $data['company_id'] : null;
+        $userMessage = trim((string) ($data['message'] ?? ''));
+
+        $task = $this->em->getRepository(Task::class)->find($taskId);
+        if (!$task instanceof Task) {
+            throw new \RuntimeException('task not found for McpChat job');
+        }
+        $userInteraction = $this->em->getRepository(TaskInteration::class)->find($interactionId);
+        if ($userInteraction instanceof TaskInteration) {
+            $userInteraction->setStatus('processing');
+            $this->em->flush();
+        }
+
+        $company = $this->resolveCompany($companyId);
+        $providerConfig = $this->resolveProviderConfig($company, $aiProvider);
+        if ($providerConfig === null) {
+            if ($userInteraction instanceof TaskInteration) {
+                $userInteraction->setStatus('error');
+                $this->em->flush();
+            }
+            throw new \RuntimeException("AI provider not configured: {$aiProvider}");
+        }
+
+        try {
+            $history = $this->loadHistory($task);
+            $assistantText = $this->runLlmWithMcpTools($aiProvider, $providerConfig, $history, $userMessage !== '' ? $userMessage : (string) ($userInteraction?->getBody() ?? ''));
+            $assistant = $this->addInteraction($task, $company, 'comment', $assistantText, 'private', 'done');
+            if ($userInteraction instanceof TaskInteration) {
+                $userInteraction->setStatus('done');
+            }
+            $task->setAlterDate(new \DateTime('now'));
+            $this->em->flush();
+            $this->notifyChatWebsocket($company, $task, $assistant, $aiProvider);
+        } catch (\Throwable $e) {
+            if ($userInteraction instanceof TaskInteration) {
+                $userInteraction->setStatus('error');
+                $this->em->flush();
+            }
+            throw $e;
+        }
+    }
+
+    private function notifyChatWebsocket(People $company, Task $task, TaskInteration $assistant, string $provider): void
+    {
+        if ($this->integrationService === null) {
+            return;
+        }
+        $payload = json_encode([
+            'action' => 'mcp_chat_reply',
+            'task_id' => $task->getId(),
+            'interaction_id' => $assistant->getId(),
+            'provider' => $provider,
+            'body' => $assistant->getBody(),
+            'status' => 'done',
+        ], JSON_UNESCAPED_UNICODE);
+        // Ephemeral device fan-out is handled by existing Websocket consumers
+        $this->integrationService->addManagerPushIntegrations((string) $payload, $company);
+        try {
+            $this->integrationService->addIntegration((string) $payload, 'Websocket', null, null, $company);
+        } catch (\Throwable) {
+            // non-fatal
+        }
     }
 
     /**
@@ -352,14 +471,23 @@ class McpChatService
         return $task;
     }
 
-    private function addInteraction(Task $task, People $by, string $type, string $body, string $visibility): TaskInteration
-    {
+    private function addInteraction(
+        Task $task,
+        People $by,
+        string $type,
+        string $body,
+        string $visibility,
+        string $status = 'done',
+    ): TaskInteration {
         $row = new TaskInteration();
         $row->setTask($task);
         $row->setRegisteredBy($by);
         $row->setType($type);
         $row->setBody($body);
         $row->setVisibility($visibility);
+        if (method_exists($row, 'setStatus')) {
+            $row->setStatus($status);
+        }
         $row->setRead(0);
         $row->setNotified(0);
         $this->em->persist($row);
