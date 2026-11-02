@@ -125,6 +125,7 @@ class McpChatService
                 'model' => (string) ($cfg['model'] ?? ''),
                 'base_url' => (string) ($cfg['base_url'] ?? ''),
                 'system_prompt' => (string) ($cfg['system_prompt'] ?? ''),
+                'workspace_id' => (string) ($cfg['workspace_id'] ?? ''),
                 'has_key' => $keyVal !== '',
                 'api_key_masked' => $keyVal !== '' ? $this->maskKey($keyVal) : null,
             ];
@@ -161,6 +162,7 @@ class McpChatService
                 'base_url' => (string) ($incoming['base_url'] ?? $def['base_url']),
                 'api_key' => $apiKey,
                 'system_prompt' => (string) ($incoming['system_prompt'] ?? $prev['system_prompt'] ?? ''),
+                'workspace_id' => (string) ($incoming['workspace_id'] ?? $prev['workspace_id'] ?? ''),
             ];
         }
         $row = $this->findConfigRow($company);
@@ -423,7 +425,15 @@ class McpChatService
         $providerKey = strtolower($providerKey);
 
         if ($providerKey === 'claude' || str_contains($baseUrl, 'anthropic.com')) {
-            return $this->callClaude($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
+            return $this->callClaude(
+                $baseUrl,
+                $model,
+                $apiKey,
+                $system,
+                $historySlice,
+                $userMessage,
+                (string) ($providerConfig['workspace_id'] ?? ''),
+            );
         }
         if ($providerKey === 'gemini' || str_contains($baseUrl, 'generativelanguage.googleapis.com')) {
             return $this->callGemini($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
@@ -478,6 +488,7 @@ class McpChatService
         string $system,
         array $historySlice,
         string $userMessage,
+        string $workspaceId = '',
     ): string {
         $messages = [];
         foreach ($historySlice as $row) {
@@ -491,13 +502,18 @@ class McpChatService
             $messages[] = ['role' => $role, 'content' => (string) ($row['content'] ?? '')];
         }
         $messages[] = ['role' => 'user', 'content' => $userMessage];
+        $headers = [
+            'Content-Type: application/json',
+            'x-api-key: ' . $apiKey,
+            'anthropic-version: 2023-06-01',
+        ];
+        $workspaceId = trim($workspaceId);
+        if ($workspaceId !== '') {
+            $headers[] = 'anthropic-workspace-id: ' . $workspaceId;
+        }
         $decoded = $this->httpJson(
             $baseUrl . '/messages',
-            [
-                'Content-Type: application/json',
-                'x-api-key: ' . $apiKey,
-                'anthropic-version: 2023-06-01',
-            ],
+            $headers,
             [
                 'model' => $model,
                 'max_tokens' => 2048,
