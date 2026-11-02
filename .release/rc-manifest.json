@@ -1,19 +1,13 @@
 {
-  "version": "1.0.17",
+  "version": "1.0.19",
   "rc": 1,
-  "branch": "rc/1.0.17-rc.1",
-  "baseMaster": "10cbda4e497a71b09f0210a855765db12a24b77a",
+  "branch": "rc/1.0.19-rc.1",
+  "baseMaster": "03fde7c30cc78333b762f45dd99684a16769c39e",
   "tasks": [
-    65
+    1300
   ],
   "frozen": true,
-  "contentCommit": "c1b7e6c5d49cbc60484bec1064078b96697a9252",
   "repositories": {
-    "ControleOnline/api-platform-mcp": "c1b7e6c5d49cbc60484bec1064078b96697a9252"
-  },
-  "validation": {
-    "scope": "MCP publication required to restore API staging; preserve LinkedIn, Mercado Livre and #264.",
-    "tests": "19 MCP tests/113 assertions; 21 consumer API tests/1918 assertions; provider contracts and isolated production cache passed.",
-    "authorization": "Explicit human approval for package publication using luizkim; application production is excluded."
+    "ControleOnline/api-platform-mcp": "1ac096dde651edf5077591d5e146b0f8c118e6e3"
   }
 }
