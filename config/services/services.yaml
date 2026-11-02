@@ -25,3 +25,12 @@ services:
 
     ControleOnline\Controller\McpController:
         tags: ['controller.service_arguments']
+
+    # Chat MCP (Task type=ia) — company-scoped providers via configs
+    ControleOnline\Service\McpChatService:
+        autowire: true
+        autoconfigure: true
+
+    ControleOnline\Controller\McpChatController:
+        tags: ['controller.service_arguments']
+
