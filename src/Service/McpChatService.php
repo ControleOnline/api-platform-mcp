@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ControleOnline\Service;
 
 use ControleOnline\Entity\Config;
+use ControleOnline\Entity\DeviceConfig;
 use ControleOnline\Entity\Module;
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Status;
@@ -15,6 +16,7 @@ use ControleOnline\Entity\Integration;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
 use ControleOnline\Service\IntegrationService;
+use ControleOnline\Service\Client\WebsocketClient;
 /**
  * Orchestrates MCP chat sessions persisted as Task(type=ia) + TaskInteration.
  * LLM provider keys stay server-side; tool calls go through McpServerService.
@@ -29,6 +31,7 @@ class McpChatService
         private readonly McpServerService $mcpServer,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
         private readonly ?IntegrationService $integrationService = null,
+        private readonly ?WebsocketClient $websocketClient = null,
     ) {
     }
 
@@ -162,6 +165,13 @@ class McpChatService
                 $userInteraction->setStatus('error');
                 $this->em->flush();
             }
+            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
+                'event' => 'mcp_chat_reply',
+                'status' => 'error',
+                'interaction_id' => $interactionId,
+                'body' => 'AI provider not configured',
+                'user_interaction_id' => $interactionId,
+            ]);
             throw new \RuntimeException("AI provider not configured: {$aiProvider}");
         }
 
@@ -174,35 +184,79 @@ class McpChatService
             }
             $task->setAlterDate(new \DateTime('now'));
             $this->em->flush();
-            $this->notifyChatWebsocket($company, $task, $assistant, $aiProvider);
+            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
+                'event' => 'mcp_chat_reply',
+                'status' => 'done',
+                'interaction_id' => $assistant->getId(),
+                'user_interaction_id' => $interactionId,
+                'body' => $assistant->getBody(),
+            ]);
         } catch (\Throwable $e) {
             if ($userInteraction instanceof TaskInteration) {
                 $userInteraction->setStatus('error');
                 $this->em->flush();
             }
+            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
+                'event' => 'mcp_chat_reply',
+                'status' => 'error',
+                'interaction_id' => $interactionId,
+                'user_interaction_id' => $interactionId,
+                'body' => $e->getMessage(),
+            ]);
             throw $e;
         }
     }
 
-    private function notifyChatWebsocket(People $company, Task $task, TaskInteration $assistant, string $provider): void
+    /**
+     * Push realtime event to company devices (same shape as OrderProductRealtimeService).
+     *
+     * @param array<string, mixed> $extra
+     */
+    private function notifyChatWebsocketEvent(People $company, Task $task, string $provider, array $extra): void
     {
-        if ($this->integrationService === null) {
+        $companyId = $company->getId();
+        $base = array_merge([
+            'store' => 'websocket',
+            'event' => 'mcp_chat_reply',
+            'company' => $companyId,
+            'companyId' => $companyId,
+            'task_id' => $task->getId(),
+            'provider' => $provider,
+            'sentAt' => date(DATE_ATOM),
+        ], $extra);
+
+        $payload = json_encode([$base], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($payload === false) {
             return;
         }
-        $payload = json_encode([
-            'action' => 'mcp_chat_reply',
-            'task_id' => $task->getId(),
-            'interaction_id' => $assistant->getId(),
-            'provider' => $provider,
-            'body' => $assistant->getBody(),
-            'status' => 'done',
-        ], JSON_UNESCAPED_UNICODE);
-        // Ephemeral device fan-out is handled by existing Websocket consumers
-        $this->integrationService->addManagerPushIntegrations((string) $payload, $company);
-        try {
-            $this->integrationService->addIntegration((string) $payload, 'Websocket', null, null, $company);
-        } catch (\Throwable) {
-            // non-fatal
+
+        if ($this->websocketClient !== null) {
+            $sentDevices = [];
+            foreach ($this->em->getRepository(DeviceConfig::class)->findBy(['people' => $company]) as $deviceConfig) {
+                if (!$deviceConfig instanceof DeviceConfig || !$deviceConfig->getDevice()) {
+                    continue;
+                }
+                $device = $deviceConfig->getDevice();
+                $deviceKey = (string) ($device->getId() ?: spl_object_id($device));
+                if (isset($sentDevices[$deviceKey])) {
+                    continue;
+                }
+                $sentDevices[$deviceKey] = true;
+                try {
+                    $this->websocketClient->push($device, $payload);
+                } catch (\Throwable) {
+                    // non-fatal per device
+                }
+            }
+        }
+
+        // Fallback queue for websocket:start consumers (device optional)
+        if ($this->integrationService !== null) {
+            try {
+                $this->integrationService->addIntegration($payload, 'Websocket', null, null, $company);
+            } catch (\Throwable) {
+                // non-fatal
+            }
         }
     }
 
