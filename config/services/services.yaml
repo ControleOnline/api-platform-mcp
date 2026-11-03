@@ -27,7 +27,9 @@ services:
         tags: ['controller.service_arguments']
 
     # Chat MCP (Task type=ia) — company-scoped providers via configs
+    # public: IntegrationService resolve ContaineOnline\Service\{QueueName}Service via container->has()
     ControleOnline\Service\McpChatService:
+        public: true
         autowire: true
         autoconfigure: true
 
