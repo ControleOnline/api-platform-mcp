@@ -158,7 +158,8 @@ class McpChatService
             $this->em->flush();
         }
 
-        $company = $this->resolveCompany($companyId);
+        // Queue worker has no Security user — resolve company by id only
+        $company = $this->resolveCompany($companyId, skipUserScope: true);
         $providerConfig = $this->resolveProviderConfig($company, $aiProvider);
         if ($providerConfig === null) {
             if ($userInteraction instanceof TaskInteration) {
@@ -439,14 +440,14 @@ class McpChatService
         throw new \RuntimeException('No module available to attach ai-providers config.');
     }
 
-    private function resolveCompany(?int $companyId): People
+    private function resolveCompany(?int $companyId, bool $skipUserScope = false): People
     {
         if ($companyId !== null && $companyId > 0) {
             $company = $this->em->getRepository(People::class)->find($companyId);
             if (!$company instanceof People) {
                 throw new \InvalidArgumentException('company_id not found');
             }
-            if ($this->companyScopeProvider !== null) {
+            if (!$skipUserScope && $this->companyScopeProvider !== null) {
                 $allowed = array_column($this->companyScopeProvider->listForCurrentUser(), 'id');
                 if (!in_array($companyId, $allowed, true)) {
                     throw new \InvalidArgumentException('company_id not in user scope');
