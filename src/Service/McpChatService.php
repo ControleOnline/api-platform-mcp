@@ -17,17 +17,15 @@ use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInt
 use Symfony\Component\Security\Core\Authentication\Token\UsernamePasswordToken;
 
 /**
- * MCP chat sessions persisted as Task(type=ia) + TaskInteration.
+ * AI conversations persisted as Task + TaskInteration, processed by the McpChat queue.
  *
- * Phase 1 (HTTP, /ai): persist the user turn and queue Integration(McpChat).
- * Phase 2 (worker): run the LLM tool loop, persist the reply, push a websocket event.
- *
- * Channels:
- * - web: internal user; tools run as that user (the worker impersonates Integration.user);
- *   the reply is private and pushed only to the device that asked.
- * - whatsapp: external customer (queued by WhatsAppCloudService); the reply is public, so
- *   TaskInterationService::notifyClient sends it to WhatsApp. Once the task is handed off
- *   (relationship/support) the AI stops answering.
+ * - Internal chat (/ai, employee): Task ia with announce {"channel":"mcp"}; MCP business tools run
+ *   as that employee; replies are private and pushed only to the asking device.
+ * - Customer conversation (WhatsApp, e-mail or a customer using /ai): while tasks.ai_agent is set
+ *   the AI answers the customer (public reply -> TaskInterationService::notifyClient delivers it),
+ *   classifies the ticket and hands off to relationship (CRM) or support. Employees answer the
+ *   customer themselves in CRM/Support; an employee reply takes the conversation from the AI.
+ * - assign(): an employee puts the AI on a CRM/support ticket; the AI makes the first contact.
  */
 class McpChatService
 {
@@ -40,6 +38,7 @@ class McpChatService
         private readonly McpChatProviderConfig $providers,
         private readonly McpChatLlmClient $llm,
         private readonly McpChatToolbox $toolbox,
+        private readonly McpChatPrompts $prompts,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
         private readonly ?IntegrationService $integrationService = null,
         private readonly ?ConversationRealtimeNotifier $realtime = null,
@@ -49,6 +48,8 @@ class McpChatService
     }
 
     /**
+     * POST /mcp/chat — an employee's internal chat, or a customer writing to the company AI.
+     *
      * @param array{provider?: string, task_id?: int, message: string, company_id?: int} $input
      * @return array<string, mixed>
      */
@@ -58,59 +59,37 @@ class McpChatService
         if ($message === '') {
             throw new \InvalidArgumentException('message is required');
         }
-        $auth = $this->security->getUser();
-        $user = $auth instanceof User ? $auth->getPeople() : ($auth instanceof People ? $auth : null);
-        if (!$user instanceof People) {
-            throw new \RuntimeException('Authenticated People user required');
-        }
+        $user = $this->currentPeople();
+        $companyId = isset($input['company_id']) ? (int) $input['company_id'] : null;
+        $employee = $this->isEmployee($companyId);
+        $company = $this->resolveCompany($companyId, skipUserScope: !$employee);
+        $taskId = isset($input['task_id']) ? (int) $input['task_id'] : 0;
 
-        $company = $this->resolveCompany($input['company_id'] ?? null);
         $resolved = $this->providers->resolve($company, $input['provider'] ?? null);
         if ($resolved === null) {
             throw new \InvalidArgumentException('AI provider not configured or disabled for this company');
         }
         [$provider, $config] = $resolved;
 
-        $task = $this->resolveOrCreateTask(
-            isset($input['task_id']) ? (int) $input['task_id'] : null,
-            $user,
-            $company,
-            $provider,
-            (string) ($config['model'] ?? ''),
-            $message,
-        );
-        $interaction = $this->addInteraction($task, $user, $message, 'private', 'pending');
-        $this->em->flush();
-
-        $job = [
-            'action' => 'mcp_chat',
-            'channel' => McpChatToolbox::CHANNEL_WEB,
-            'task_id' => $task->getId(),
-            'interaction_id' => $interaction->getId(),
-            'provider' => $provider,
-            'company_id' => $company->getId(),
-            'user_id' => $user->getId(),
-            'device' => trim((string) $this->requestStack?->getCurrentRequest()?->headers->get('device', '')),
-        ];
-
-        $integrationId = null;
-        if ($this->integrationService !== null) {
-            $integrationId = $this->integrationService->addIntegration(
-                (string) json_encode($job, JSON_UNESCAPED_UNICODE),
-                'McpChat',
-                null,
-                $auth instanceof User ? $auth : null,
-                $company,
-            )->getId();
+        if ($employee && ($taskId === 0 || $this->isInternalChat($this->findTask($taskId)))) {
+            $task = $taskId ? $this->ownInternalChat($taskId, $user, $company) : $this->newInternalChat($user, $company, $provider, (string) $config['model'], $message);
+            $channel = McpChatToolbox::CHANNEL_WEB;
+            $visibility = 'private';
         } else {
-            $this->processQueuedChat($job); // tests / no queue wired
+            $task = $taskId ? $this->customerOwnConversation($taskId, $user, $company) : $this->newCustomerConversation($user, $company, $message);
+            $channel = McpChatToolbox::CHANNEL_CUSTOMER;
+            $visibility = 'public';
         }
+
+        $interaction = $this->addInteraction($task, $user, $message, $visibility, 'pending');
+        $this->em->flush();
+        $integrationId = $this->enqueue($task, $company, $channel, 'customer', $interaction->getId(), $provider);
 
         return [
             'task_id' => $task->getId(),
             'interaction_id' => $interaction->getId(),
             'integration_id' => $integrationId,
-            'type' => 'ia',
+            'type' => $task->getType(),
             'provider' => $provider,
             'status' => 'pending',
             'message' => null,
@@ -119,8 +98,46 @@ class McpChatService
     }
 
     /**
-     * Integration queue handler (queueName=McpChat).
+     * An employee puts the AI on a customer ticket (CRM/support/ia). Optional instructions are kept
+     * as a private note; the AI then writes to the customer through the ticket's connection.
+     *
+     * @return array{task_id: int, ai_agent: string}
      */
+    public function assign(int $taskId, ?string $instructions, ?string $provider = null, ?int $companyId = null): array
+    {
+        $company = $this->resolveCompany($companyId);
+        $task = $this->customerTicket($taskId, $company);
+        if ($this->providers->resolve($company, $provider) === null) {
+            throw new \InvalidArgumentException('AI provider not configured or disabled for this company');
+        }
+        $task->setAiAgent($provider ?: 'auto');
+        $this->addCustomerContacts($task);
+        $instructions = trim((string) $instructions);
+        $this->toolbox->note($task, $this->currentPeople(), '[Instruções para a IA] ' . ($instructions !== '' ? $instructions : 'Fazer o primeiro contato.'));
+        $this->enqueue($task, $company, McpChatToolbox::CHANNEL_CUSTOMER, 'assign', 0, $task->getAiAgent());
+
+        return ['task_id' => (int) $task->getId(), 'ai_agent' => (string) $task->getAiAgent()];
+    }
+
+    /**
+     * An employee takes a ticket from the AI (optionally moving ia -> relationship|support).
+     *
+     * @return array{task_id: int, type: string}
+     */
+    public function humanHandoff(int $taskId, string $type, ?int $companyId = null): array
+    {
+        $company = $this->resolveCompany($companyId);
+        $task = $this->customerTicket($taskId, $company);
+        $this->toolbox->handoff($task, $company, [
+            'type' => $type,
+            'summary' => 'Assumido por ' . trim((string) $this->currentPeople()->getName()),
+        ]);
+        $this->notify($company, $task, null, ['status' => 'done', 'handoff' => $task->getType()]);
+
+        return ['task_id' => (int) $task->getId(), 'type' => (string) $task->getType()];
+    }
+
+    /** Integration queue handler (queueName=McpChat). */
     public function integrate(Integration $integration): void
     {
         $data = json_decode((string) $integration->getBody(), true);
@@ -130,27 +147,22 @@ class McpChatService
         $this->processQueuedChat($data, $integration->getUser());
     }
 
-    /**
-     * @param array<string, mixed> $data
-     */
+    /** @param array<string, mixed> $data */
     public function processQueuedChat(array $data, ?User $asUser = null): void
     {
-        $channel = ($data['channel'] ?? '') === McpChatToolbox::CHANNEL_WHATSAPP
-            ? McpChatToolbox::CHANNEL_WHATSAPP
-            : McpChatToolbox::CHANNEL_WEB;
-        $device = $channel === McpChatToolbox::CHANNEL_WEB ? (string) ($data['device'] ?? '') : null;
-        $interactionId = (int) ($data['interaction_id'] ?? 0);
-
         $task = $this->em->getRepository(Task::class)->find((int) ($data['task_id'] ?? 0));
         if (!$task instanceof Task) {
             throw new \RuntimeException('task not found for McpChat job');
         }
+        $channel = $this->isInternalChat($task) ? McpChatToolbox::CHANNEL_WEB : McpChatToolbox::CHANNEL_CUSTOMER;
+        $device = trim((string) ($data['device'] ?? '')) ?: null;
+        $interactionId = (int) ($data['interaction_id'] ?? 0);
         $company = $this->resolveCompany(isset($data['company_id']) ? (int) $data['company_id'] : null, skipUserScope: true);
-        $userInteraction = $this->em->getRepository(TaskInteration::class)->find($interactionId);
+        $userInteraction = $interactionId ? $this->em->getRepository(TaskInteration::class)->find($interactionId) : null;
         $userInteraction = $userInteraction instanceof TaskInteration ? $userInteraction : null;
 
-        // Handed off to a human between enqueue and processing: the AI stays quiet.
-        if ($task->getType() !== 'ia') {
+        // Customer conversations are answered only while an AI is assigned (a person may have taken over).
+        if ($channel === McpChatToolbox::CHANNEL_CUSTOMER && !$task->getAiAgent()) {
             $this->setStatus($userInteraction, 'done');
 
             return;
@@ -169,17 +181,16 @@ class McpChatService
             $answer = $this->asUser($channel === McpChatToolbox::CHANNEL_WEB ? $asUser : null, fn () => $this->llm->run(
                 $provider,
                 $config,
-                $this->systemPrompt($channel, $company, $task, (string) ($config['system_prompt'] ?? '')),
-                $this->loadHistory($task, $company, $channel),
-                $this->toolbox->definitions($channel),
+                $this->prompts->system($channel, (string) ($data['trigger'] ?? 'customer'), $company, $task, (string) ($config['system_prompt'] ?? '')),
+                $this->prompts->history($this->recentInteractions($task), $company, $task, $channel),
+                $this->toolbox->definitions($channel, $task),
                 $this->toolbox->executor($channel, $task, $company),
             ));
 
-            // Public on WhatsApp: TaskInterationService::notifyClient delivers it to the customer.
-            $visibility = $channel === McpChatToolbox::CHANNEL_WHATSAPP ? 'public' : 'private';
+            // Customer conversations: public, so notifyClient delivers it through the ticket's connection.
+            $visibility = $channel === McpChatToolbox::CHANNEL_CUSTOMER ? 'public' : 'private';
             $assistant = $this->addInteraction($task, $company, $answer, $visibility, 'done');
             $this->setStatus($userInteraction, 'done', flush: false);
-            // Task::setAlterDate ships with tasks #18; older tasks releases lack it (it used to crash here).
             if (method_exists($task, 'setAlterDate')) {
                 $task->setAlterDate(new \DateTime('now'));
             }
@@ -189,7 +200,7 @@ class McpChatService
                 'status' => 'done',
                 'interaction_id' => $assistant->getId(),
                 'user_interaction_id' => $interactionId,
-                'handoff' => $task->getType() !== 'ia' ? $task->getType() : null,
+                'handoff' => $task->getAiAgent() ? null : $task->getType(),
             ]);
         } catch (\Throwable $e) {
             $this->setStatus($userInteraction, 'error');
@@ -200,34 +211,6 @@ class McpChatService
             ]);
             // Not rethrown: a retry would call the LLM again and duplicate replies.
         }
-    }
-
-    /**
-     * An attendant takes over a customer (WhatsApp) conversation from /ai; the AI stops answering.
-     *
-     * @return array{task_id: int, type: string}
-     */
-    public function humanHandoff(int $taskId, string $type, ?int $companyId = null): array
-    {
-        $company = $this->resolveCompany($companyId);
-        $task = $this->em->getRepository(Task::class)->find($taskId);
-        if (!$task instanceof Task || (int) $task->getProvider()?->getId() !== (int) $company->getId()) {
-            throw new \InvalidArgumentException('task_id not in company scope');
-        }
-        // Only customer conversations; internal chats are private to their author.
-        if (!in_array('via:ia', (array) $task->getAnnounce(true), true)) {
-            throw new \InvalidArgumentException('task is not a customer conversation');
-        }
-        $auth = $this->security->getUser();
-        $by = $auth instanceof User ? $auth->getPeople() : ($auth instanceof People ? $auth : null);
-
-        $this->toolbox->handoff($task, $company, [
-            'type' => $type,
-            'summary' => 'Assumido manualmente por ' . trim((string) $by?->getName()),
-        ]);
-        $this->notify($company, $task, null, ['status' => 'done', 'handoff' => $task->getType()]);
-
-        return ['task_id' => (int) $task->getId(), 'type' => (string) $task->getType()];
     }
 
     /** @return list<array<string, mixed>> */
@@ -242,68 +225,48 @@ class McpChatService
         return $this->providers->forUi($this->resolveCompany($companyId));
     }
 
-    /**
-     * @param array<string, array<string, mixed>> $providers
-     * @return array{config_id: int}
-     */
+    /** @return array{config_id: int} */
     public function saveProvidersConfig(array $providers, ?int $companyId = null): array
     {
         return $this->providers->save($this->resolveCompany($companyId), $providers);
     }
 
-    private function systemPrompt(string $channel, People $company, Task $task, string $custom): string
+    public function isInternalChat(?Task $task): bool
     {
-        $companyLabel = trim((string) ($company->getAlias() ?: $company->getName())) . ' (company_id ' . $company->getId() . ')';
-        $base = $channel === McpChatToolbox::CHANNEL_WHATSAPP
-            ? "You are the WhatsApp virtual attendant of {$companyLabel}, talking with an external customer"
-                . ($task->getClient() ? ' named ' . trim((string) $task->getClient()->getName()) : '') . ".\n"
-                . "Find out what they need and collect what a human will need: their name, their company, "
-                . "and the details of the request. You have no access to internal data: never invent prices, "
-                . "deadlines, stock or policies. When the matter needs a person, call handoff_to_human with "
-                . "type relationship for sales or support for help with the product, and then tell the customer "
-                . "a person will continue here. Write short WhatsApp messages in plain text, no markdown, in the "
-                . "customer's language."
-            : "You are the ControleOnline assistant for {$companyLabel}. You talk with an employee of the company.\n"
-                . "Answer with real data: use the tools (start with list_query_datasets / query_business_data, "
-                . "scoped to this company) before stating any number, and say plainly when the data is not "
-                . "available. Never invent figures. Reply in the user's language, concisely.";
+        $announce = $task?->getAnnounce(true) ?? [];
 
-        return trim($custom) !== '' ? $base . "\n\nCompany instructions:\n" . trim($custom) : $base;
+        return $task?->getType() === 'ia' && !array_is_list($announce) && ($announce['channel'] ?? '') === 'mcp';
     }
 
-    /**
-     * Role comes from the author: the company (AI) is "assistant"; the person who wrote is "user".
-     * On WhatsApp, private notes (handoff summaries) never reach the model.
-     *
-     * @return list<array{role: string, content: string}>
-     */
-    private function loadHistory(Task $task, People $company, string $channel): array
+    private function enqueue(Task $task, People $company, string $channel, string $trigger, int $interactionId, ?string $provider): ?int
     {
-        $rows = $this->em->getRepository(TaskInteration::class)->findBy(
-            ['task' => $task, 'type' => 'comment'],
-            ['id' => 'DESC'],
-            self::HISTORY_LIMIT,
-        );
-        $history = [];
-        foreach (array_reverse($rows) as $row) {
-            $body = trim((string) $row->getBody());
-            if ($body === '' || ($channel === McpChatToolbox::CHANNEL_WHATSAPP && $row->getVisibility() !== 'public')) {
-                continue;
-            }
-            $isAi = (int) $row->getRegisteredBy()?->getId() === (int) $company->getId();
-            $history[] = ['role' => $isAi ? 'assistant' : 'user', 'content' => $body];
-        }
-        // Providers expect the conversation to start with the user.
-        while ($history !== [] && $history[0]['role'] === 'assistant') {
-            array_shift($history);
+        $auth = $this->security->getUser();
+        $job = [
+            'action' => 'mcp_chat',
+            'channel' => $channel,
+            'trigger' => $trigger,
+            'task_id' => $task->getId(),
+            'interaction_id' => $interactionId,
+            'provider' => $provider !== 'auto' ? $provider : null,
+            'company_id' => $company->getId(),
+            'device' => trim((string) $this->requestStack?->getCurrentRequest()?->headers->get('device', '')),
+        ];
+        if ($this->integrationService === null) {
+            $this->processQueuedChat($job); // tests / no queue wired
+
+            return null;
         }
 
-        return $history;
+        return $this->integrationService->addIntegration(
+            (string) json_encode($job, JSON_UNESCAPED_UNICODE),
+            'McpChat',
+            null,
+            $auth instanceof User ? $auth : null,
+            $company,
+        )->getId();
     }
 
-    /**
-     * Run as the user who asked so MCP tools apply that user's company scope.
-     */
+    /** Run as the employee who asked so MCP tools apply that user's company scope. */
     private function asUser(?User $user, callable $fn): mixed
     {
         if ($user === null || $this->tokenStorage === null) {
@@ -318,16 +281,54 @@ class McpChatService
         }
     }
 
-    /** @param array<string, mixed> $event */
+    /** Internal chats: the asking device only. Customer conversations: company MANAGER devices (+ asking device). */
     private function notify(People $company, Task $task, ?string $device, array $event): void
     {
+        $event += ['event' => 'mcp_chat_reply', 'channel' => $this->isInternalChat($task) ? 'web' : 'customer'];
         try {
-            $this->realtime?->notify($company, $task, $event + [
-                'event' => 'mcp_chat_reply',
-                'channel' => $device === null ? McpChatToolbox::CHANNEL_WHATSAPP : McpChatToolbox::CHANNEL_WEB,
-            ], $device);
+            if ($this->isInternalChat($task)) {
+                if ($device) {
+                    $this->realtime?->notify($company, $task, $event, $device);
+                }
+                return;
+            }
+            $this->realtime?->notify($company, $task, $event);
+            if ($device) {
+                $this->realtime?->notify($company, $task, $event, $device);
+            }
         } catch (\Throwable) {
             // Realtime is best effort; the front reloads on its own fallback timer.
+        }
+    }
+
+    /** @return list<TaskInteration> oldest first */
+    private function recentInteractions(Task $task): array
+    {
+        $rows = $this->em->getRepository(TaskInteration::class)->findBy(
+            ['task' => $task, 'type' => 'comment'],
+            ['id' => 'DESC'],
+            self::HISTORY_LIMIT,
+        );
+
+        return array_reverse($rows);
+    }
+
+    /** CRM/support tickets reached by AI need a destination: copy the client's phone/e-mail if missing. */
+    private function addCustomerContacts(Task $task): void
+    {
+        $announce = $task->getAnnounce(true);
+        $hasContact = array_is_list($announce) && array_filter($announce, static fn ($v) => is_string($v)
+            && (preg_match('/^\d{10,15}$/', $v) || filter_var($v, FILTER_VALIDATE_EMAIL)));
+        if ($hasContact || !$task->getClient()) {
+            return;
+        }
+        foreach ($task->getClient()->getPhone() as $phone) {
+            $task->addAnnounce($phone->getDdi() . $phone->getDdd() . $phone->getPhone());
+            return;
+        }
+        foreach ($task->getClient()->getEmail() as $email) {
+            $task->addAnnounce(strtolower($email->getEmail()));
+            return;
         }
     }
 
@@ -342,6 +343,24 @@ class McpChatService
         }
     }
 
+    private function currentPeople(): People
+    {
+        $auth = $this->security->getUser();
+        $user = $auth instanceof User ? $auth->getPeople() : ($auth instanceof People ? $auth : null);
+        if (!$user instanceof People) {
+            throw new \RuntimeException('Authenticated People user required');
+        }
+
+        return $user;
+    }
+
+    private function isEmployee(?int $companyId): bool
+    {
+        $allowed = array_map('intval', array_column($this->companyScopeProvider?->listForCurrentUser() ?? [], 'id'));
+
+        return $companyId ? in_array($companyId, $allowed, true) : $allowed !== [];
+    }
+
     private function resolveCompany(?int $companyId, bool $skipUserScope = false): People
     {
         if ($companyId !== null && $companyId > 0) {
@@ -349,11 +368,8 @@ class McpChatService
             if (!$company instanceof People) {
                 throw new \InvalidArgumentException('company_id not found');
             }
-            if (!$skipUserScope && $this->companyScopeProvider !== null) {
-                $allowed = array_column($this->companyScopeProvider->listForCurrentUser(), 'id');
-                if (!in_array($companyId, $allowed, true)) {
-                    throw new \InvalidArgumentException('company_id not in user scope');
-                }
+            if (!$skipUserScope && !$this->isEmployee($companyId)) {
+                throw new \InvalidArgumentException('company_id not in user scope');
             }
 
             return $company;
@@ -367,41 +383,88 @@ class McpChatService
         return $company;
     }
 
-    private function resolveOrCreateTask(?int $taskId, People $user, People $company, string $provider, string $model, string $firstMessage): Task
+    private function findTask(int $taskId): ?Task
     {
-        if ($taskId !== null && $taskId > 0) {
-            $task = $this->em->getRepository(Task::class)->find($taskId);
-            if (!$task instanceof Task) {
-                throw new \InvalidArgumentException('task_id not found');
-            }
-            if ($task->getType() !== 'ia') {
-                throw new \InvalidArgumentException('task is not type=ia');
-            }
-            if ((int) $task->getProvider()?->getId() !== (int) $company->getId()) {
-                throw new \InvalidArgumentException('task_id not in company scope');
-            }
-            // Private internal chats: only the creator may continue them.
-            if ((int) $task->getRegisteredBy()?->getId() !== (int) $user->getId()) {
-                throw new \InvalidArgumentException('task_id not owned by current user');
-            }
+        $task = $this->em->getRepository(Task::class)->find($taskId);
 
-            return $task;
+        return $task instanceof Task ? $task : null;
+    }
+
+    private function inCompany(?Task $task, People $company): Task
+    {
+        if (!$task || (int) $task->getProvider()?->getId() !== (int) $company->getId()) {
+            throw new \InvalidArgumentException('task_id not in company scope');
         }
 
-        $status = $this->em->getRepository(Status::class)->findOneBy(['context' => 'ia', 'status' => 'open']);
+        return $task;
+    }
+
+    /** Internal chats are private to their author. */
+    private function ownInternalChat(int $taskId, People $user, People $company): Task
+    {
+        $task = $this->inCompany($this->findTask($taskId), $company);
+        if ((int) $task->getRegisteredBy()?->getId() !== (int) $user->getId()) {
+            throw new \InvalidArgumentException('task_id not owned by current user');
+        }
+
+        return $task;
+    }
+
+    /** A customer continuing their own conversation from /ai. */
+    private function customerOwnConversation(int $taskId, People $user, People $company): Task
+    {
+        $task = $this->inCompany($this->findTask($taskId), $company);
+        if ($this->isInternalChat($task) || (int) $task->getClient()?->getId() !== (int) $user->getId()) {
+            throw new \InvalidArgumentException('Employees answer customers in CRM / Support');
+        }
+
+        return $task;
+    }
+
+    private function customerTicket(int $taskId, People $company): Task
+    {
+        $task = $this->inCompany($this->findTask($taskId), $company);
+        if ($this->isInternalChat($task) || !in_array($task->getType(), ['ia', 'relationship', 'support'], true)) {
+            throw new \InvalidArgumentException('task is not a customer conversation');
+        }
+
+        return $task;
+    }
+
+    private function newInternalChat(People $user, People $company, string $provider, string $model, string $firstMessage): Task
+    {
+        $task = $this->newTask('ia', $user, $company, $firstMessage);
+        $task->setClient($user);
+        $task->setAnnounce(['channel' => 'mcp', 'ai_provider' => $provider, 'model' => $model]);
+        $this->em->flush();
+
+        return $task;
+    }
+
+    private function newCustomerConversation(People $user, People $company, string $firstMessage): Task
+    {
+        $task = $this->newTask('ia', $user, $company, $firstMessage);
+        $task->setClient($user);
+        $task->setAnnounce([]);
+        $task->setAiAgent('auto');
+        $this->em->flush();
+
+        return $task;
+    }
+
+    private function newTask(string $type, People $user, People $company, string $firstMessage): Task
+    {
+        $status = $this->em->getRepository(Status::class)->findOneBy(['context' => $type, 'status' => 'open']);
         if (!$status instanceof Status) {
-            throw new \RuntimeException('Status context=ia open not seeded — run tasks migration Version20261101170000');
+            throw new \RuntimeException("Status context={$type} open not seeded");
         }
         $task = new Task();
-        $task->setType('ia');
+        $task->setType($type);
         $task->setName(mb_substr($firstMessage, 0, 50));
         $task->setRegisteredBy($user);
         $task->setProvider($company);
-        $task->setClient($user);
         $task->setTaskStatus($status);
-        $task->setAnnounce(['channel' => 'mcp', 'ai_provider' => $provider, 'model' => $model]);
         $this->em->persist($task);
-        $this->em->flush();
 
         return $task;
     }

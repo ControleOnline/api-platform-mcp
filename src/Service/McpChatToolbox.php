@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ControleOnline\Service;
 
 use ControleOnline\Entity\People;
+use ControleOnline\Entity\Status;
 use ControleOnline\Entity\Task;
 use ControleOnline\Entity\TaskInteration;
 use Doctrine\ORM\EntityManagerInterface;
@@ -12,14 +13,15 @@ use Doctrine\ORM\EntityManagerInterface;
 /**
  * Tools exposed to the LLM per channel.
  *
- * - web (/ai, internal user): read-only MCP business tools, executed as the asking user.
- * - whatsapp (external customer): NO business data. Only handoff_to_human, which turns
- *   the "ia" task into relationship (sales/CRM) or support (analyst) so a human takes over.
+ * - web (internal /ai chat of an employee): read-only MCP business tools, run as that employee.
+ * - customer (conversation with a customer over WhatsApp, e-mail or /ai): NO business data.
+ *   classify_task keeps the CRM/support ticket right; handoff_to_human turns the conversation
+ *   into relationship (sales/CRM) or support and removes the AI.
  */
 class McpChatToolbox
 {
     public const CHANNEL_WEB = 'web';
-    public const CHANNEL_WHATSAPP = 'whatsapp';
+    public const CHANNEL_CUSTOMER = 'customer';
     public const HANDOFF_TYPES = ['relationship', 'support'];
 
     /** Mutating MCP tools are never offered to the chat. */
@@ -35,10 +37,10 @@ class McpChatToolbox
     }
 
     /** @return list<array{name: string, description: string, schema: array<string, mixed>}> */
-    public function definitions(string $channel): array
+    public function definitions(string $channel, ?Task $task = null): array
     {
-        if ($channel === self::CHANNEL_WHATSAPP) {
-            return [$this->handoffDefinition()];
+        if ($channel === self::CHANNEL_CUSTOMER) {
+            return [$this->handoffDefinition($task), $this->classifyDefinition($task)];
         }
 
         $listed = $this->mcpServer->handle(['jsonrpc' => '2.0', 'id' => 'tools', 'method' => 'tools/list']);
@@ -60,18 +62,16 @@ class McpChatToolbox
         return $tools;
     }
 
-    /**
-     * @return callable(string, array<string, mixed>): string
-     */
+    /** @return callable(string, array<string, mixed>): string */
     public function executor(string $channel, Task $task, People $company): callable
     {
         return function (string $name, array $args) use ($channel, $task, $company): string {
-            if ($channel === self::CHANNEL_WHATSAPP) {
-                if ($name !== 'handoff_to_human') {
-                    throw new \InvalidArgumentException("Tool not available: {$name}");
-                }
-
-                return $this->handoff($task, $company, $args);
+            if ($channel === self::CHANNEL_CUSTOMER) {
+                return match ($name) {
+                    'handoff_to_human' => $this->handoff($task, $company, $args),
+                    'classify_task' => $this->classify($task, $args),
+                    default => throw new \InvalidArgumentException("Tool not available: {$name}"),
+                };
             }
             if (in_array($name, self::BLOCKED_TOOLS, true)) {
                 throw new \InvalidArgumentException("Tool not available in chat: {$name}");
@@ -79,6 +79,59 @@ class McpChatToolbox
 
             return $this->callMcp($name, $args);
         };
+    }
+
+    /**
+     * Hands the conversation to humans: ia -> relationship|support; the AI is unassigned.
+     * Used by the AI tool and when an employee takes over.
+     */
+    public function handoff(Task $task, People $company, array $args): string
+    {
+        $type = strtolower(trim((string) ($args['type'] ?? '')));
+        if ($type === '' && in_array($task->getType(), self::HANDOFF_TYPES, true)) {
+            $type = (string) $task->getType();
+        }
+        if (!in_array($type, self::HANDOFF_TYPES, true)) {
+            throw new \InvalidArgumentException('type must be relationship or support');
+        }
+        if ($task->getType() !== $type) {
+            $task->setType($type);
+            $task->setTaskStatus($this->statusService->discoveryStatus('open', 'open', $type));
+        }
+        if (method_exists($task, 'setAiAgent')) {
+            $task->setAiAgent(null);
+        }
+        $this->touch($task);
+        $label = $type === 'support' ? 'Suporte' : 'Comercial';
+        $this->note($task, $company, "[IA → {$label}] " . trim((string) ($args['summary'] ?? '')));
+
+        return "OK: conversation is now with the {$label} team. Tell the customer, briefly, that a person will continue here.";
+    }
+
+    private function classify(Task $task, array $args): string
+    {
+        $changes = [];
+        $statusName = trim((string) ($args['status'] ?? ''));
+        if ($statusName !== '') {
+            $status = $this->em->getRepository(Status::class)->findOneBy(['context' => $task->getType(), 'status' => $statusName]);
+            if (!$status instanceof Status) {
+                throw new \InvalidArgumentException('Unknown status for ' . $task->getType() . ': ' . $statusName);
+            }
+            $task->setTaskStatus($status);
+            $changes[] = "status={$statusName}";
+        }
+        $title = trim((string) ($args['title'] ?? ''));
+        if ($title !== '') {
+            $task->setName(mb_substr($title, 0, 50));
+            $changes[] = 'title';
+        }
+        if ($changes === []) {
+            return 'Nothing to change.';
+        }
+        $this->touch($task);
+        $this->em->flush();
+
+        return 'OK: ' . implode(', ', $changes);
     }
 
     private function callMcp(string $name, array $args): string
@@ -101,62 +154,77 @@ class McpChatToolbox
         return mb_substr(implode("\n", $texts), 0, 20000);
     }
 
-    /**
-     * Turns an "ia" conversation into relationship/support. Used by the AI tool and by
-     * an attendant taking over from /ai.
-     */
-    public function handoff(Task $task, People $company, array $args): string
+    /** Private note for employees; never sent to the customer. */
+    public function note(Task $task, People $by, string $body): void
     {
-        $type = strtolower(trim((string) ($args['type'] ?? '')));
-        if (!in_array($type, self::HANDOFF_TYPES, true)) {
-            throw new \InvalidArgumentException('type must be relationship or support');
-        }
-        if ($task->getType() !== 'ia') {
-            return 'Conversation is already with a human team.';
-        }
-        $summary = trim((string) ($args['summary'] ?? ''));
-
-        $task->setType($type);
-        $task->setTaskStatus($this->statusService->discoveryStatus('open', 'open', $type));
-        if (method_exists($task, 'setAlterDate')) {
-            $task->setAlterDate(new \DateTime('now'));
-        }
-
-        // Private note for the attendant; never sent to the customer.
         $note = new TaskInteration();
         $note->setTask($task);
-        $note->setRegisteredBy($company);
+        $note->setRegisteredBy($by);
         $note->setType('comment');
         $note->setVisibility('private');
-        $note->setBody('[Handoff IA → ' . ($type === 'support' ? 'Suporte' : 'Comercial') . '] ' . $summary);
+        $note->setBody($body);
         $note->setStatus('done');
         $note->setRead(0);
         $note->setNotified(0);
         $this->em->persist($note);
         $this->em->flush();
-
-        return "OK: conversation transferred to the {$type} team. Tell the customer, briefly, that a person will continue the conversation here. Do not promise times you do not know.";
     }
 
-    /** @return array{name: string, description: string, schema: array<string, mixed>} */
-    private function handoffDefinition(): array
+    private function touch(Task $task): void
     {
+        if (method_exists($task, 'setAlterDate')) {
+            $task->setAlterDate(new \DateTime('now'));
+        }
+    }
+
+    /** @return list<string> */
+    private function statusNames(?Task $task): array
+    {
+        if (!$task || $task->getType() === 'ia') {
+            return [];
+        }
+        $names = [];
+        foreach ($this->em->getRepository(Status::class)->findBy(['context' => $task->getType()]) as $status) {
+            $names[] = (string) $status->getStatus();
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    private function classifyDefinition(?Task $task): array
+    {
+        $statuses = $this->statusNames($task);
+        $properties = ['title' => ['type' => 'string', 'description' => 'Short title for the ticket (max 50 chars).']];
+        if ($statuses !== []) {
+            $properties['status'] = ['type' => 'string', 'enum' => $statuses, 'description' => 'Current stage of this ticket.'];
+        }
+
+        return [
+            'name' => 'classify_task',
+            'description' => 'Keep the ticket classified as the conversation evolves: a clear title and, for '
+                . 'CRM/support tickets, the stage that matches what has happened so far.',
+            'schema' => ['type' => 'object', 'properties' => $properties, 'additionalProperties' => false],
+        ];
+    }
+
+    private function handoffDefinition(?Task $task): array
+    {
+        $needsType = !$task || $task->getType() === 'ia';
+
         return [
             'name' => 'handoff_to_human',
-            'description' => 'Transfer this WhatsApp conversation to a human. Use type "relationship" for sales '
-                . '(quotes, prices, buying, plans, new customers) and "support" for help with the product, '
-                . 'bugs, access or billing problems of existing customers. Call it once you have collected '
-                . 'what the human needs (name, company, what they want) or when the customer asks for a person.',
+            'description' => 'Hand this conversation to a person and stop answering. '
+                . ($needsType ? 'Use type "relationship" for sales (quotes, prices, buying, plans) and "support" for '
+                    . 'help with the product, access or billing of existing customers. ' : '')
+                . 'Call it when the matter needs a human or the customer asks for one, after collecting what '
+                . 'the person needs (name, company, details of the request).',
             'schema' => [
                 'type' => 'object',
                 'properties' => [
                     'type' => ['type' => 'string', 'enum' => self::HANDOFF_TYPES],
-                    'summary' => [
-                        'type' => 'string',
-                        'description' => 'What the customer wants and every detail collected so far, for the attendant.',
-                    ],
+                    'summary' => ['type' => 'string', 'description' => 'Everything collected so far, for the employee.'],
                 ],
-                'required' => ['type', 'summary'],
+                'required' => $needsType ? ['type', 'summary'] : ['summary'],
                 'additionalProperties' => false,
             ],
         ];
