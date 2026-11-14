@@ -21,7 +21,7 @@ use Symfony\Component\Security\Core\Authentication\Token\UsernamePasswordToken;
  *
  * - Internal chat (/ai, employee): Task ia with announce {"channel":"mcp"}; MCP business tools run
  *   as that employee; replies are private and pushed only to the asking device.
- * - Customer conversation (WhatsApp, e-mail or a customer using /ai): while tasks.ai_agent is set
+ * - Customer conversation (WhatsApp or e-mail): while tasks.ai_agent is set
  *   the AI answers the customer (public reply -> TaskInterationService::notifyClient delivers it),
  *   classifies the ticket and hands off to relationship (CRM) or support. Employees answer the
  *   customer themselves in CRM/Support; an employee reply takes the conversation from the AI.
@@ -48,7 +48,8 @@ class McpChatService
     }
 
     /**
-     * POST /mcp/chat — an employee's internal chat, or a customer writing to the company AI.
+     * POST /mcp/chat — internal chat of an employee of the company, with that company's AI.
+     * Customers never use /ai: they reach the company AI through its WhatsApp / e-mail connections.
      *
      * @param array{provider?: string, task_id?: int, message: string, company_id?: int} $input
      * @return array<string, mixed>
@@ -60,9 +61,8 @@ class McpChatService
             throw new \InvalidArgumentException('message is required');
         }
         $user = $this->currentPeople();
-        $companyId = isset($input['company_id']) ? (int) $input['company_id'] : null;
-        $employee = $this->isEmployee($companyId);
-        $company = $this->resolveCompany($companyId, skipUserScope: !$employee);
+        // /ai belongs to the company's employees and uses that company's AI; outsiders get a 400.
+        $company = $this->resolveCompany(isset($input['company_id']) ? (int) $input['company_id'] : null);
         $taskId = isset($input['task_id']) ? (int) $input['task_id'] : 0;
 
         $resolved = $this->providers->resolve($company, $input['provider'] ?? null);
@@ -71,15 +71,11 @@ class McpChatService
         }
         [$provider, $config] = $resolved;
 
-        if ($employee && ($taskId === 0 || $this->isInternalChat($this->findTask($taskId)))) {
-            $task = $taskId ? $this->ownInternalChat($taskId, $user, $company) : $this->newInternalChat($user, $company, $provider, (string) $config['model'], $message);
-            $channel = McpChatToolbox::CHANNEL_WEB;
-            $visibility = 'private';
-        } else {
-            $task = $taskId ? $this->customerOwnConversation($taskId, $user, $company) : $this->newCustomerConversation($user, $company, $message);
-            $channel = McpChatToolbox::CHANNEL_CUSTOMER;
-            $visibility = 'public';
-        }
+        $task = $taskId
+            ? $this->ownInternalChat($taskId, $user, $company)
+            : $this->newInternalChat($user, $company, $provider, (string) $config['model'], $message);
+        $channel = McpChatToolbox::CHANNEL_WEB;
+        $visibility = 'private';
 
         $interaction = $this->addInteraction($task, $user, $message, $visibility, 'pending');
         $this->em->flush();
@@ -403,19 +399,11 @@ class McpChatService
     private function ownInternalChat(int $taskId, People $user, People $company): Task
     {
         $task = $this->inCompany($this->findTask($taskId), $company);
+        if (!$this->isInternalChat($task)) {
+            throw new \InvalidArgumentException('Customer conversations are answered in CRM / Support');
+        }
         if ((int) $task->getRegisteredBy()?->getId() !== (int) $user->getId()) {
             throw new \InvalidArgumentException('task_id not owned by current user');
-        }
-
-        return $task;
-    }
-
-    /** A customer continuing their own conversation from /ai. */
-    private function customerOwnConversation(int $taskId, People $user, People $company): Task
-    {
-        $task = $this->inCompany($this->findTask($taskId), $company);
-        if ($this->isInternalChat($task) || (int) $task->getClient()?->getId() !== (int) $user->getId()) {
-            throw new \InvalidArgumentException('Employees answer customers in CRM / Support');
         }
 
         return $task;
@@ -436,17 +424,6 @@ class McpChatService
         $task = $this->newTask('ia', $user, $company, $firstMessage);
         $task->setClient($user);
         $task->setAnnounce(['channel' => 'mcp', 'ai_provider' => $provider, 'model' => $model]);
-        $this->em->flush();
-
-        return $task;
-    }
-
-    private function newCustomerConversation(People $user, People $company, string $firstMessage): Task
-    {
-        $task = $this->newTask('ia', $user, $company, $firstMessage);
-        $task->setClient($user);
-        $task->setAnnounce([]);
-        $task->setAiAgent('auto');
         $this->em->flush();
 
         return $task;
