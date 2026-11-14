@@ -108,6 +108,58 @@ class McpChatController
         }
     }
 
+    #[Route('/chat/handoff', name: 'controleonline_mcp_chat_handoff', methods: ['POST', 'OPTIONS'])]
+    public function handoff(Request $request): Response
+    {
+        if ($request->getMethod() === 'OPTIONS') {
+            return new Response('', Response::HTTP_NO_CONTENT, $this->corsHeaders());
+        }
+        if (!$this->authorizationChecker->isGranted('ROLE_HUMAN')) {
+            return new JsonResponse(['error' => 'Authentication required'], Response::HTTP_UNAUTHORIZED, $this->corsHeaders());
+        }
+        $payload = json_decode($request->getContent() ?: '{}', true);
+        if (!is_array($payload) || empty($payload['task_id']) || empty($payload['type'])) {
+            return new JsonResponse(['error' => 'task_id and type are required'], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+        try {
+            $result = $this->chatService->humanHandoff(
+                (int) $payload['task_id'],
+                (string) $payload['type'],
+                isset($payload['company_id']) ? (int) $payload['company_id'] : null,
+            );
+
+            return new JsonResponse($result, Response::HTTP_OK, $this->corsHeaders());
+        } catch (\InvalidArgumentException $e) {
+            return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+    }
+
+    /** Puts the company AI on a customer ticket (CRM/support); it makes the first contact. */
+    #[Route('/chat/assign', name: 'controleonline_mcp_chat_assign', methods: ['POST', 'OPTIONS'])]
+    public function assign(Request $request): Response
+    {
+        if ($request->getMethod() === 'OPTIONS') {
+            return new Response('', Response::HTTP_NO_CONTENT, $this->corsHeaders());
+        }
+        if (!$this->authorizationChecker->isGranted('ROLE_HUMAN')) {
+            return new JsonResponse(['error' => 'Authentication required'], Response::HTTP_UNAUTHORIZED, $this->corsHeaders());
+        }
+        $payload = json_decode($request->getContent() ?: '{}', true);
+        if (!is_array($payload) || empty($payload['task_id'])) {
+            return new JsonResponse(['error' => 'task_id is required'], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+        try {
+            return new JsonResponse($this->chatService->assign(
+                (int) $payload['task_id'],
+                isset($payload['instructions']) ? (string) $payload['instructions'] : null,
+                isset($payload['provider']) ? (string) $payload['provider'] : null,
+                isset($payload['company_id']) ? (int) $payload['company_id'] : null,
+            ), Response::HTTP_OK, $this->corsHeaders());
+        } catch (\InvalidArgumentException $e) {
+            return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+    }
+
     /** @return array<string, string> */
     private function corsHeaders(): array
     {
