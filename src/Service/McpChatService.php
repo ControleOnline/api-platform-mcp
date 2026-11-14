@@ -39,6 +39,7 @@ class McpChatService
         private readonly McpChatLlmClient $llm,
         private readonly McpChatToolbox $toolbox,
         private readonly McpChatPrompts $prompts,
+        private readonly McpChatTickets $tickets,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
         private readonly ?IntegrationService $integrationService = null,
         private readonly ?ConversationRealtimeNotifier $realtime = null,
@@ -65,9 +66,11 @@ class McpChatService
         $company = $this->resolveCompany(isset($input['company_id']) ? (int) $input['company_id'] : null);
         $taskId = isset($input['task_id']) ? (int) $input['task_id'] : 0;
 
-        $resolved = $this->providers->resolve($company, $input['provider'] ?? null);
-        if ($resolved === null) {
-            throw new \InvalidArgumentException('AI provider not configured or disabled for this company');
+        // A ticket the user opened with the platform, or a company without its own AI: ticket mode.
+        $ticket = $taskId ? $this->tickets->findOwn($taskId, $user) : null;
+        $resolved = $ticket ? null : $this->providers->resolve($company, $input['provider'] ?? null);
+        if ($ticket || $resolved === null) {
+            return $this->ticketMessage($ticket, $user, $company, (string) ($input['type'] ?? 'support'), $message);
         }
         [$provider, $config] = $resolved;
 
@@ -94,6 +97,39 @@ class McpChatService
     }
 
     /**
+     * Message on a ticket to the platform (opened now if needed). Humans of the platform answer in
+     * CRM / Support; if they put their AI on the ticket, it answers with the platform's tokens.
+     *
+     * @return array<string, mixed>
+     */
+    private function ticketMessage(?Task $ticket, People $user, People $company, string $type, string $message): array
+    {
+        $ticket ??= $this->tickets->open($user, $company, $type, $message);
+        $platform = $ticket->getProvider();
+        $withAi = (bool) $ticket->getAiAgent();
+        $interaction = $this->addInteraction($ticket, $user, $message, 'public', $withAi ? 'pending' : 'done');
+        if (method_exists($ticket, 'setAlterDate')) {
+            $ticket->setAlterDate(new \DateTime('now'));
+        }
+        $this->em->flush();
+
+        if ($withAi) {
+            $this->enqueue($ticket, $platform, McpChatToolbox::CHANNEL_CUSTOMER, 'customer', $interaction->getId(), $ticket->getAiAgent());
+        } else {
+            $this->notify($platform, $ticket, null, ['event' => 'conversation_message', 'status' => 'received', 'interaction_id' => $interaction->getId()]);
+        }
+
+        return [
+            'task_id' => $ticket->getId(),
+            'interaction_id' => $interaction->getId(),
+            'mode' => 'ticket',
+            'type' => $ticket->getType(),
+            'status' => $withAi ? 'pending' : 'done',
+            'async' => $withAi,
+        ];
+    }
+
+    /**
      * An employee puts the AI on a customer ticket (CRM/support/ia). Optional instructions are kept
      * as a private note; the AI then writes to the customer through the ticket's connection.
      *
@@ -107,7 +143,7 @@ class McpChatService
             throw new \InvalidArgumentException('AI provider not configured or disabled for this company');
         }
         $task->setAiAgent($provider ?: 'auto');
-        $this->addCustomerContacts($task);
+        $this->tickets->addCustomerContacts($task);
         $instructions = trim((string) $instructions);
         $this->toolbox->note($task, $this->currentPeople(), '[Instruções para a IA] ' . ($instructions !== '' ? $instructions : 'Fazer o primeiro contato.'));
         $this->enqueue($task, $company, McpChatToolbox::CHANNEL_CUSTOMER, 'assign', 0, $task->getAiAgent());
@@ -307,25 +343,6 @@ class McpChatService
         );
 
         return array_reverse($rows);
-    }
-
-    /** CRM/support tickets reached by AI need a destination: copy the client's phone/e-mail if missing. */
-    private function addCustomerContacts(Task $task): void
-    {
-        $announce = $task->getAnnounce(true);
-        $hasContact = array_is_list($announce) && array_filter($announce, static fn ($v) => is_string($v)
-            && (preg_match('/^\d{10,15}$/', $v) || filter_var($v, FILTER_VALIDATE_EMAIL)));
-        if ($hasContact || !$task->getClient()) {
-            return;
-        }
-        foreach ($task->getClient()->getPhone() as $phone) {
-            $task->addAnnounce($phone->getDdi() . $phone->getDdd() . $phone->getPhone());
-            return;
-        }
-        foreach ($task->getClient()->getEmail() as $email) {
-            $task->addAnnounce(strtolower($email->getEmail()));
-            return;
-        }
     }
 
     private function setStatus(?TaskInteration $interaction, string $status, bool $flush = true): void
