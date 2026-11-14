@@ -4,39 +4,53 @@ declare(strict_types=1);
 
 namespace ControleOnline\Service;
 
-use ControleOnline\Entity\Config;
-use ControleOnline\Entity\DeviceConfig;
-use ControleOnline\Entity\Module;
+use ControleOnline\Entity\Integration;
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Status;
 use ControleOnline\Entity\Task;
-use ControleOnline\Entity\User;
 use ControleOnline\Entity\TaskInteration;
-use ControleOnline\Entity\Integration;
+use ControleOnline\Entity\User;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
-use ControleOnline\Service\IntegrationService;
-use ControleOnline\Service\Client\WebsocketClient;
+use Symfony\Component\HttpFoundation\RequestStack;
+use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
+use Symfony\Component\Security\Core\Authentication\Token\UsernamePasswordToken;
+
 /**
- * Orchestrates MCP chat sessions persisted as Task(type=ia) + TaskInteration.
- * LLM provider keys stay server-side; tool calls go through McpServerService.
+ * AI conversations persisted as Task + TaskInteration, processed by the McpChat queue.
+ *
+ * - Internal chat (/ai, employee): Task ia with announce {"channel":"mcp"}; MCP business tools run
+ *   as that employee; replies are private and pushed only to the asking device.
+ * - Customer conversation (WhatsApp, e-mail or a customer using /ai): while tasks.ai_agent is set
+ *   the AI answers the customer (public reply -> TaskInterationService::notifyClient delivers it),
+ *   classifies the ticket and hands off to relationship (CRM) or support. Employees answer the
+ *   customer themselves in CRM/Support; an employee reply takes the conversation from the AI.
+ * - assign(): an employee puts the AI on a CRM/support ticket; the AI makes the first contact.
  */
 class McpChatService
 {
-    public const CONFIG_KEY = 'ai-providers';
+    public const CONFIG_KEY = McpChatProviderConfig::CONFIG_KEY;
+    private const HISTORY_LIMIT = 30;
 
     public function __construct(
         private readonly EntityManagerInterface $em,
         private readonly Security $security,
-        private readonly McpServerService $mcpServer,
+        private readonly McpChatProviderConfig $providers,
+        private readonly McpChatLlmClient $llm,
+        private readonly McpChatToolbox $toolbox,
+        private readonly McpChatPrompts $prompts,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
         private readonly ?IntegrationService $integrationService = null,
-        private readonly ?WebsocketClient $websocketClient = null,
+        private readonly ?ConversationRealtimeNotifier $realtime = null,
+        private readonly ?TokenStorageInterface $tokenStorage = null,
+        private readonly ?RequestStack $requestStack = null,
     ) {
     }
 
     /**
-     * @param array{provider?: string, task_id?: int, message: string, company_id?: int, model?: string} $input
+     * POST /mcp/chat — an employee's internal chat, or a customer writing to the company AI.
+     *
+     * @param array{provider?: string, task_id?: int, message: string, company_id?: int} $input
      * @return array<string, mixed>
      */
     public function chat(array $input): array
@@ -45,77 +59,38 @@ class McpChatService
         if ($message === '') {
             throw new \InvalidArgumentException('message is required');
         }
+        $user = $this->currentPeople();
+        $companyId = isset($input['company_id']) ? (int) $input['company_id'] : null;
+        $employee = $this->isEmployee($companyId);
+        $company = $this->resolveCompany($companyId, skipUserScope: !$employee);
+        $taskId = isset($input['task_id']) ? (int) $input['task_id'] : 0;
 
-        $auth = $this->security->getUser();
-        if ($auth instanceof People) {
-            $user = $auth;
-        } elseif ($auth instanceof User) {
-            $user = $auth->getPeople();
+        $resolved = $this->providers->resolve($company, $input['provider'] ?? null);
+        if ($resolved === null) {
+            throw new \InvalidArgumentException('AI provider not configured or disabled for this company');
+        }
+        [$provider, $config] = $resolved;
+
+        if ($employee && ($taskId === 0 || $this->isInternalChat($this->findTask($taskId)))) {
+            $task = $taskId ? $this->ownInternalChat($taskId, $user, $company) : $this->newInternalChat($user, $company, $provider, (string) $config['model'], $message);
+            $channel = McpChatToolbox::CHANNEL_WEB;
+            $visibility = 'private';
         } else {
-            throw new \RuntimeException('Authenticated People user required');
-        }
-        if (!$user instanceof People) {
-            throw new \RuntimeException('Authenticated People user required');
+            $task = $taskId ? $this->customerOwnConversation($taskId, $user, $company) : $this->newCustomerConversation($user, $company, $message);
+            $channel = McpChatToolbox::CHANNEL_CUSTOMER;
+            $visibility = 'public';
         }
 
-        $company = $this->resolveCompany($input['company_id'] ?? null);
-        $aiProvider = strtolower((string) ($input['provider'] ?? 'grok'));
-        $providerConfig = $this->resolveProviderConfig($company, $aiProvider);
-        if ($providerConfig === null) {
-            throw new \InvalidArgumentException("AI provider not configured or disabled for this company: {$aiProvider}");
-        }
-        $task = $this->resolveOrCreateTask(
-            isset($input['task_id']) ? (int) $input['task_id'] : null,
-            $user,
-            $company,
-            $aiProvider,
-            $providerConfig['model'] ?? ($input['model'] ?? null),
-            $message,
-        );
-
-        // Phase 1: persist user turn and enqueue async processing
-        $userInteraction = $this->addInteraction($task, $user, 'comment', $message, 'private', 'pending');
+        $interaction = $this->addInteraction($task, $user, $message, $visibility, 'pending');
         $this->em->flush();
-
-        $payload = json_encode([
-            'action' => 'mcp_chat',
-            'task_id' => $task->getId(),
-            'interaction_id' => $userInteraction->getId(),
-            'provider' => $aiProvider,
-            'company_id' => $company->getId(),
-            'user_id' => $user->getId(),
-            'message' => $message,
-        ], JSON_UNESCAPED_UNICODE);
-
-        $integrationId = null;
-        if ($this->integrationService !== null) {
-            $authUser = $this->security->getUser();
-            $userEntity = $authUser instanceof User ? $authUser : null;
-            $integration = $this->integrationService->addIntegration(
-                (string) $payload,
-                'McpChat',
-                null,
-                $userEntity,
-                $company,
-            );
-            $integrationId = $integration->getId();
-        } else {
-            // Fallback sync when IntegrationService is not wired (tests)
-            $this->processQueuedChat([
-                'task_id' => $task->getId(),
-                'interaction_id' => $userInteraction->getId(),
-                'provider' => $aiProvider,
-                'company_id' => $company->getId(),
-                'message' => $message,
-            ]);
-        }
+        $integrationId = $this->enqueue($task, $company, $channel, 'customer', $interaction->getId(), $provider);
 
         return [
             'task_id' => $task->getId(),
-            'interaction_id' => $userInteraction->getId(),
+            'interaction_id' => $interaction->getId(),
             'integration_id' => $integrationId,
-            'type' => 'ia',
-            'provider' => $aiProvider,
+            'type' => $task->getType(),
+            'provider' => $provider,
             'status' => 'pending',
             'message' => null,
             'async' => true,
@@ -123,321 +98,267 @@ class McpChatService
     }
 
     /**
-     * Integration queue handler (queueName=McpChat → ControleOnline\Service\McpChatService).
+     * An employee puts the AI on a customer ticket (CRM/support/ia). Optional instructions are kept
+     * as a private note; the AI then writes to the customer through the ticket's connection.
+     *
+     * @return array{task_id: int, ai_agent: string}
      */
+    public function assign(int $taskId, ?string $instructions, ?string $provider = null, ?int $companyId = null): array
+    {
+        $company = $this->resolveCompany($companyId);
+        $task = $this->customerTicket($taskId, $company);
+        if ($this->providers->resolve($company, $provider) === null) {
+            throw new \InvalidArgumentException('AI provider not configured or disabled for this company');
+        }
+        $task->setAiAgent($provider ?: 'auto');
+        $this->addCustomerContacts($task);
+        $instructions = trim((string) $instructions);
+        $this->toolbox->note($task, $this->currentPeople(), '[Instruções para a IA] ' . ($instructions !== '' ? $instructions : 'Fazer o primeiro contato.'));
+        $this->enqueue($task, $company, McpChatToolbox::CHANNEL_CUSTOMER, 'assign', 0, $task->getAiAgent());
+
+        return ['task_id' => (int) $task->getId(), 'ai_agent' => (string) $task->getAiAgent()];
+    }
+
+    /**
+     * An employee takes a ticket from the AI (optionally moving ia -> relationship|support).
+     *
+     * @return array{task_id: int, type: string}
+     */
+    public function humanHandoff(int $taskId, string $type, ?int $companyId = null): array
+    {
+        $company = $this->resolveCompany($companyId);
+        $task = $this->customerTicket($taskId, $company);
+        $this->toolbox->handoff($task, $company, [
+            'type' => $type,
+            'summary' => 'Assumido por ' . trim((string) $this->currentPeople()->getName()),
+        ]);
+        $this->notify($company, $task, null, ['status' => 'done', 'handoff' => $task->getType()]);
+
+        return ['task_id' => (int) $task->getId(), 'type' => (string) $task->getType()];
+    }
+
+    /** Integration queue handler (queueName=McpChat). */
     public function integrate(Integration $integration): void
     {
-        $body = $integration->getBody();
-        $data = is_string($body) ? json_decode($body, true) : (is_array($body) ? $body : null);
+        $data = json_decode((string) $integration->getBody(), true);
         if (!is_array($data)) {
             throw new \RuntimeException('Invalid McpChat integration body');
         }
-        $this->processQueuedChat($data);
+        $this->processQueuedChat($data, $integration->getUser());
     }
 
-    /**
-     * Phase 2: call LLM, persist assistant turn, update statuses, push websocket.
-     *
-     * @param array<string, mixed> $data
-     */
-    public function processQueuedChat(array $data): void
+    /** @param array<string, mixed> $data */
+    public function processQueuedChat(array $data, ?User $asUser = null): void
     {
-        $taskId = (int) ($data['task_id'] ?? 0);
-        $interactionId = (int) ($data['interaction_id'] ?? 0);
-        $aiProvider = strtolower((string) ($data['provider'] ?? 'grok'));
-        $companyId = isset($data['company_id']) ? (int) $data['company_id'] : null;
-        $userMessage = trim((string) ($data['message'] ?? ''));
-
-        $task = $this->em->getRepository(Task::class)->find($taskId);
+        $task = $this->em->getRepository(Task::class)->find((int) ($data['task_id'] ?? 0));
         if (!$task instanceof Task) {
             throw new \RuntimeException('task not found for McpChat job');
         }
-        $userInteraction = $this->em->getRepository(TaskInteration::class)->find($interactionId);
-        if ($userInteraction instanceof TaskInteration) {
-            $userInteraction->setStatus('processing');
-            $this->em->flush();
-        }
+        $channel = $this->isInternalChat($task) ? McpChatToolbox::CHANNEL_WEB : McpChatToolbox::CHANNEL_CUSTOMER;
+        $device = trim((string) ($data['device'] ?? '')) ?: null;
+        $interactionId = (int) ($data['interaction_id'] ?? 0);
+        $company = $this->resolveCompany(isset($data['company_id']) ? (int) $data['company_id'] : null, skipUserScope: true);
+        $userInteraction = $interactionId ? $this->em->getRepository(TaskInteration::class)->find($interactionId) : null;
+        $userInteraction = $userInteraction instanceof TaskInteration ? $userInteraction : null;
 
-        // Queue worker has no Security user — resolve company by id only
-        $company = $this->resolveCompany($companyId, skipUserScope: true);
-        $providerConfig = $this->resolveProviderConfig($company, $aiProvider);
-        if ($providerConfig === null) {
-            if ($userInteraction instanceof TaskInteration) {
-                $userInteraction->setStatus('error');
-                $this->em->flush();
-            }
-            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
-                'event' => 'mcp_chat_reply',
-                'status' => 'error',
-                'interaction_id' => $interactionId,
-                'body' => 'AI provider not configured',
-                'user_interaction_id' => $interactionId,
-            ]);
-            throw new \RuntimeException("AI provider not configured: {$aiProvider}");
-        }
+        // Customer conversations are answered only while an AI is assigned (a person may have taken over).
+        if ($channel === McpChatToolbox::CHANNEL_CUSTOMER && !$task->getAiAgent()) {
+            $this->setStatus($userInteraction, 'done');
 
-        try {
-            $history = $this->loadHistory($task);
-            $assistantText = $this->runLlmWithMcpTools($aiProvider, $providerConfig, $history, $userMessage !== '' ? $userMessage : (string) ($userInteraction?->getBody() ?? ''));
-            $assistant = $this->addInteraction($task, $company, 'comment', $assistantText, 'private', 'done');
-            if ($userInteraction instanceof TaskInteration) {
-                $userInteraction->setStatus('done');
-            }
-            $task->setAlterDate(new \DateTime('now'));
-            $this->em->flush();
-            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
-                'event' => 'mcp_chat_reply',
-                'status' => 'done',
-                'interaction_id' => $assistant->getId(),
-                'user_interaction_id' => $interactionId,
-                'body' => $assistant->getBody(),
-            ]);
-        } catch (\Throwable $e) {
-            if ($userInteraction instanceof TaskInteration) {
-                $userInteraction->setStatus('error');
-                $this->em->flush();
-            }
-            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
-                'event' => 'mcp_chat_reply',
-                'status' => 'error',
-                'interaction_id' => $interactionId,
-                'user_interaction_id' => $interactionId,
-                'body' => $e->getMessage(),
-            ]);
-            throw $e;
-        }
-    }
-
-    /**
-     * Push realtime event to company devices (same shape as OrderProductRealtimeService).
-     *
-     * @param array<string, mixed> $extra
-     */
-    private function notifyChatWebsocketEvent(People $company, Task $task, string $provider, array $extra): void
-    {
-        $companyId = $company->getId();
-        $base = array_merge([
-            'store' => 'websocket',
-            'event' => 'mcp_chat_reply',
-            'company' => $companyId,
-            'companyId' => $companyId,
-            'task_id' => $task->getId(),
-            'provider' => $provider,
-            'sentAt' => date(DATE_ATOM),
-        ], $extra);
-
-        $payload = json_encode([$base], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        if ($payload === false) {
             return;
         }
 
-        if ($this->websocketClient !== null) {
-            $sentDevices = [];
-            foreach ($this->em->getRepository(DeviceConfig::class)->findBy(['people' => $company]) as $deviceConfig) {
-                if (!$deviceConfig instanceof DeviceConfig || !$deviceConfig->getDevice()) {
-                    continue;
-                }
-                $device = $deviceConfig->getDevice();
-                $deviceKey = (string) ($device->getId() ?: spl_object_id($device));
-                if (isset($sentDevices[$deviceKey])) {
-                    continue;
-                }
-                $sentDevices[$deviceKey] = true;
-                try {
-                    $this->websocketClient->push($device, $payload);
-                } catch (\Throwable) {
-                    // non-fatal per device
-                }
-            }
-        }
+        $this->setStatus($userInteraction, 'processing');
+        $this->notify($company, $task, $device, ['status' => 'processing', 'user_interaction_id' => $interactionId]);
 
-        // Fallback queue for websocket:start consumers (device optional)
-        if ($this->integrationService !== null) {
-            try {
-                $this->integrationService->addIntegration($payload, 'Websocket', null, null, $company);
-            } catch (\Throwable) {
-                // non-fatal
+        try {
+            $resolved = $this->providers->resolve($company, isset($data['provider']) ? (string) $data['provider'] : null);
+            if ($resolved === null) {
+                throw new \RuntimeException('AI provider not configured for this company');
             }
+            [$provider, $config] = $resolved;
+
+            $answer = $this->asUser($channel === McpChatToolbox::CHANNEL_WEB ? $asUser : null, fn () => $this->llm->run(
+                $provider,
+                $config,
+                $this->prompts->system($channel, (string) ($data['trigger'] ?? 'customer'), $company, $task, (string) ($config['system_prompt'] ?? '')),
+                $this->prompts->history($this->recentInteractions($task), $company, $task, $channel),
+                $this->toolbox->definitions($channel, $task),
+                $this->toolbox->executor($channel, $task, $company),
+            ));
+
+            // Customer conversations: public, so notifyClient delivers it through the ticket's connection.
+            $visibility = $channel === McpChatToolbox::CHANNEL_CUSTOMER ? 'public' : 'private';
+            $assistant = $this->addInteraction($task, $company, $answer, $visibility, 'done');
+            $this->setStatus($userInteraction, 'done', flush: false);
+            if (method_exists($task, 'setAlterDate')) {
+                $task->setAlterDate(new \DateTime('now'));
+            }
+            $this->em->flush();
+
+            $this->notify($company, $task, $device, [
+                'status' => 'done',
+                'interaction_id' => $assistant->getId(),
+                'user_interaction_id' => $interactionId,
+                'handoff' => $task->getAiAgent() ? null : $task->getType(),
+            ]);
+        } catch (\Throwable $e) {
+            $this->setStatus($userInteraction, 'error');
+            $this->notify($company, $task, $device, [
+                'status' => 'error',
+                'user_interaction_id' => $interactionId,
+                'body' => mb_substr($e->getMessage(), 0, 300),
+            ]);
+            // Not rethrown: a retry would call the LLM again and duplicate replies.
         }
     }
 
-    /**
-     * @return list<array{provider: string, label: string, model: string, enabled: bool}>
-     */
+    /** @return list<array<string, mixed>> */
     public function listConfiguredProviders(?int $companyId = null): array
     {
-        $company = $this->resolveCompany($companyId);
-        $out = [];
-        foreach ($this->loadProvidersFromConfig($company) as $key => $cfg) {
-            if (!($cfg['enabled'] ?? false) || empty($cfg['api_key'])) {
-                continue;
-            }
-            $out[] = [
-                'provider' => $key,
-                'label' => (string) ($cfg['label'] ?? $key),
-                'model' => (string) ($cfg['model'] ?? ''),
-                'enabled' => true,
-                'has_key' => true,
-                'api_key_masked' => $this->maskKey((string) $cfg['api_key']),
-            ];
-        }
-
-        return $out;
+        return $this->providers->listConfigured($this->resolveCompany($companyId));
     }
 
-    /** @return array{company_id: int, config_id: int|null, config_key: string, providers: array<string, mixed>} */
+    /** @return array<string, mixed> */
     public function getProvidersConfigForUi(?int $companyId = null): array
     {
-        $company = $this->resolveCompany($companyId);
-        $row = $this->findConfigRow($company);
-        $masked = [];
-        foreach ($this->loadProvidersFromConfig($company) as $key => $cfg) {
-            $keyVal = (string) ($cfg['api_key'] ?? '');
-            $masked[$key] = [
-                'label' => $cfg['label'] ?? $key,
-                'enabled' => (bool) ($cfg['enabled'] ?? false),
-                'model' => (string) ($cfg['model'] ?? ''),
-                'base_url' => (string) ($cfg['base_url'] ?? ''),
-                'system_prompt' => (string) ($cfg['system_prompt'] ?? ''),
-                'workspace_id' => (string) ($cfg['workspace_id'] ?? ''),
-                'has_key' => $keyVal !== '',
-                'api_key_masked' => $keyVal !== '' ? $this->maskKey($keyVal) : null,
-            ];
-        }
-
-        return [
-            'company_id' => $company->getId(),
-            'config_id' => $row?->getId(),
-            'config_key' => self::CONFIG_KEY,
-            'providers' => $masked,
-        ];
+        return $this->providers->forUi($this->resolveCompany($companyId));
     }
 
-    /**
-     * @param array<string, array<string, mixed>> $providers
-     * @return array{config_id: int}
-     */
+    /** @return array{config_id: int} */
     public function saveProvidersConfig(array $providers, ?int $companyId = null): array
     {
-        $company = $this->resolveCompany($companyId);
-        $existing = $this->loadProvidersFromConfig($company);
-        $merged = [];
-        foreach ($this->defaultProviders() as $key => $def) {
-            $incoming = is_array($providers[$key] ?? null) ? $providers[$key] : [];
-            $prev = $existing[$key] ?? [];
-            $apiKey = trim((string) ($incoming['api_key'] ?? ''));
-            if ($apiKey === '' || str_contains($apiKey, '*')) {
-                $apiKey = (string) ($prev['api_key'] ?? '');
-            }
-            $merged[$key] = [
-                'label' => (string) ($incoming['label'] ?? $def['label']),
-                'enabled' => (bool) ($incoming['enabled'] ?? false),
-                'model' => (string) ($incoming['model'] ?? $def['model']),
-                'base_url' => (string) ($incoming['base_url'] ?? $def['base_url']),
-                'api_key' => $apiKey,
-                'system_prompt' => (string) ($incoming['system_prompt'] ?? $prev['system_prompt'] ?? ''),
-                'workspace_id' => (string) ($incoming['workspace_id'] ?? $prev['workspace_id'] ?? ''),
-            ];
-        }
-        $row = $this->findConfigRow($company);
-        if ($row === null) {
-            $row = new Config();
-            $row->setPeople($company);
-            $row->setConfigKey(self::CONFIG_KEY);
-            $row->setVisibility('private');
-            $row->setModule($this->resolveConfigModule());
-            $this->em->persist($row);
-        } elseif ($row->getModule() === null) {
-            $row->setModule($this->resolveConfigModule());
-        }
-        $row->setConfigValue(json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-        $this->em->flush();
-
-        return ['config_id' => $row->getId()];
+        return $this->providers->save($this->resolveCompany($companyId), $providers);
     }
 
-    /**
-     * @return array<string, mixed>|null
-     */
-    
-    private function resolveProviderConfig(People $company, string $key): ?array
+    public function isInternalChat(?Task $task): bool
     {
-        $all = $this->loadProvidersFromConfig($company);
-        $cfg = $all[$key] ?? null;
-        if (!is_array($cfg) || !($cfg['enabled'] ?? false) || empty($cfg['api_key'])) {
+        $announce = $task?->getAnnounce(true) ?? [];
+
+        return $task?->getType() === 'ia' && !array_is_list($announce) && ($announce['channel'] ?? '') === 'mcp';
+    }
+
+    private function enqueue(Task $task, People $company, string $channel, string $trigger, int $interactionId, ?string $provider): ?int
+    {
+        $auth = $this->security->getUser();
+        $job = [
+            'action' => 'mcp_chat',
+            'channel' => $channel,
+            'trigger' => $trigger,
+            'task_id' => $task->getId(),
+            'interaction_id' => $interactionId,
+            'provider' => $provider !== 'auto' ? $provider : null,
+            'company_id' => $company->getId(),
+            'device' => trim((string) $this->requestStack?->getCurrentRequest()?->headers->get('device', '')),
+        ];
+        if ($this->integrationService === null) {
+            $this->processQueuedChat($job); // tests / no queue wired
+
             return null;
         }
 
-        return $cfg;
+        return $this->integrationService->addIntegration(
+            (string) json_encode($job, JSON_UNESCAPED_UNICODE),
+            'McpChat',
+            null,
+            $auth instanceof User ? $auth : null,
+            $company,
+        )->getId();
     }
 
-    /** @return array<string, array<string, mixed>> */
-    private function defaultProviders(): array
+    /** Run as the employee who asked so MCP tools apply that user's company scope. */
+    private function asUser(?User $user, callable $fn): mixed
     {
-        return [
-            'grok' => ['label' => 'Grok', 'base_url' => 'https://api.x.ai/v1', 'model' => 'grok-4'],
-            'openai' => ['label' => 'Codex / OpenAI', 'base_url' => 'https://api.openai.com/v1', 'model' => 'gpt-4o'],
-            'gemini' => ['label' => 'Gemini', 'base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'gemini-2.0-flash'],
-            'claude' => ['label' => 'Claude', 'base_url' => 'https://api.anthropic.com/v1', 'model' => 'claude-sonnet-4'],
-        ];
+        if ($user === null || $this->tokenStorage === null) {
+            return $fn();
+        }
+        $previous = $this->tokenStorage->getToken();
+        $this->tokenStorage->setToken(new UsernamePasswordToken($user, 'mcp_chat', $user->getRoles()));
+        try {
+            return $fn();
+        } finally {
+            $this->tokenStorage->setToken($previous);
+        }
     }
 
-    private function findConfigRow(People $company): ?Config
+    /** Internal chats: the asking device only. Customer conversations: company MANAGER devices (+ asking device). */
+    private function notify(People $company, Task $task, ?string $device, array $event): void
     {
-        $row = $this->em->getRepository(Config::class)->findOneBy([
-            'people' => $company,
-            'configKey' => self::CONFIG_KEY,
-        ]);
-
-        return $row instanceof Config ? $row : null;
-    }
-
-    /** @return array<string, array<string, mixed>> */
-    private function loadProvidersFromConfig(People $company): array
-    {
-        $defaults = $this->defaultProviders();
-        $row = $this->findConfigRow($company);
-        $raw = [];
-        if ($row !== null) {
-            $decoded = json_decode($row->getConfigValue(), true);
-            if (is_array($decoded)) {
-                $raw = $decoded;
+        $event += ['event' => 'mcp_chat_reply', 'channel' => $this->isInternalChat($task) ? 'web' : 'customer'];
+        try {
+            if ($this->isInternalChat($task)) {
+                if ($device) {
+                    $this->realtime?->notify($company, $task, $event, $device);
+                }
+                return;
             }
-        }
-        $out = [];
-        foreach ($defaults as $key => $def) {
-            $cfg = is_array($raw[$key] ?? null) ? $raw[$key] : [];
-            $out[$key] = array_merge($def, $cfg);
-        }
-
-        return $out;
-    }
-
-    private function maskKey(string $key): string
-    {
-        $len = strlen($key);
-        if ($len <= 8) {
-            return str_repeat('*', $len);
-        }
-
-        return substr($key, 0, 4) . str_repeat('*', max(4, $len - 8)) . substr($key, -4);
-    }
-
-
-    private function resolveConfigModule(): Module
-    {
-        $repository = $this->em->getRepository(Module::class);
-        foreach (['mcp', 'config', 'common', 'ui-manager', 'financial'] as $moduleName) {
-            $module = $repository->findOneBy(['name' => $moduleName]);
-            if ($module instanceof Module) {
-                return $module;
+            $this->realtime?->notify($company, $task, $event);
+            if ($device) {
+                $this->realtime?->notify($company, $task, $event, $device);
             }
+        } catch (\Throwable) {
+            // Realtime is best effort; the front reloads on its own fallback timer.
         }
-        $module = $repository->findOneBy([], ['id' => 'ASC']);
-        if ($module instanceof Module) {
-            return $module;
+    }
+
+    /** @return list<TaskInteration> oldest first */
+    private function recentInteractions(Task $task): array
+    {
+        $rows = $this->em->getRepository(TaskInteration::class)->findBy(
+            ['task' => $task, 'type' => 'comment'],
+            ['id' => 'DESC'],
+            self::HISTORY_LIMIT,
+        );
+
+        return array_reverse($rows);
+    }
+
+    /** CRM/support tickets reached by AI need a destination: copy the client's phone/e-mail if missing. */
+    private function addCustomerContacts(Task $task): void
+    {
+        $announce = $task->getAnnounce(true);
+        $hasContact = array_is_list($announce) && array_filter($announce, static fn ($v) => is_string($v)
+            && (preg_match('/^\d{10,15}$/', $v) || filter_var($v, FILTER_VALIDATE_EMAIL)));
+        if ($hasContact || !$task->getClient()) {
+            return;
         }
-        throw new \RuntimeException('No module available to attach ai-providers config.');
+        foreach ($task->getClient()->getPhone() as $phone) {
+            $task->addAnnounce($phone->getDdi() . $phone->getDdd() . $phone->getPhone());
+            return;
+        }
+        foreach ($task->getClient()->getEmail() as $email) {
+            $task->addAnnounce(strtolower($email->getEmail()));
+            return;
+        }
+    }
+
+    private function setStatus(?TaskInteration $interaction, string $status, bool $flush = true): void
+    {
+        if ($interaction === null) {
+            return;
+        }
+        $interaction->setStatus($status);
+        if ($flush) {
+            $this->em->flush();
+        }
+    }
+
+    private function currentPeople(): People
+    {
+        $auth = $this->security->getUser();
+        $user = $auth instanceof User ? $auth->getPeople() : ($auth instanceof People ? $auth : null);
+        if (!$user instanceof People) {
+            throw new \RuntimeException('Authenticated People user required');
+        }
+
+        return $user;
+    }
+
+    private function isEmployee(?int $companyId): bool
+    {
+        $allowed = array_map('intval', array_column($this->companyScopeProvider?->listForCurrentUser() ?? [], 'id'));
+
+        return $companyId ? in_array($companyId, $allowed, true) : $allowed !== [];
     }
 
     private function resolveCompany(?int $companyId, bool $skipUserScope = false): People
@@ -447,355 +368,120 @@ class McpChatService
             if (!$company instanceof People) {
                 throw new \InvalidArgumentException('company_id not found');
             }
-            if (!$skipUserScope && $this->companyScopeProvider !== null) {
-                $allowed = array_column($this->companyScopeProvider->listForCurrentUser(), 'id');
-                if (!in_array($companyId, $allowed, true)) {
-                    throw new \InvalidArgumentException('company_id not in user scope');
-                }
+            if (!$skipUserScope && !$this->isEmployee($companyId)) {
+                throw new \InvalidArgumentException('company_id not in user scope');
             }
 
             return $company;
         }
-
-        if ($this->companyScopeProvider !== null) {
-            $list = $this->companyScopeProvider->listForCurrentUser();
-            if ($list === []) {
-                throw new \RuntimeException('No accessible company for current user');
-            }
-            $first = $this->em->getRepository(People::class)->find((int) $list[0]['id']);
-            if ($first instanceof People) {
-                return $first;
-            }
+        $first = $this->companyScopeProvider?->listForCurrentUser()[0]['id'] ?? null;
+        $company = $first ? $this->em->getRepository(People::class)->find((int) $first) : null;
+        if (!$company instanceof People) {
+            throw new \RuntimeException('No accessible company for current user');
         }
 
-        throw new \RuntimeException('Unable to resolve company');
+        return $company;
     }
 
-    private function resolveOrCreateTask(
-        ?int $taskId,
-        People $user,
-        People $company,
-        string $aiProvider,
-        ?string $model,
-        string $firstMessage,
-    ): Task {
-        if ($taskId !== null && $taskId > 0) {
-            $task = $this->em->getRepository(Task::class)->find($taskId);
-            if (!$task instanceof Task) {
-                throw new \InvalidArgumentException('task_id not found');
-            }
-            if ($task->getType() !== 'ia') {
-                throw new \InvalidArgumentException('task is not type=ia');
-            }
-            $taskProvider = $task->getProvider();
-            if (!$taskProvider instanceof People || (int) $taskProvider->getId() !== (int) $company->getId()) {
-                throw new \InvalidArgumentException('task_id not in company scope');
-            }
-            // Private IA chats: only the creator (or company people acting as bot) may continue.
-            $owner = $task->getRegisteredBy();
-            if ($owner instanceof People && (int) $owner->getId() !== (int) $user->getId()) {
-                throw new \InvalidArgumentException('task_id not owned by current user');
-            }
+    private function findTask(int $taskId): ?Task
+    {
+        $task = $this->em->getRepository(Task::class)->find($taskId);
 
-            return $task;
+        return $task instanceof Task ? $task : null;
+    }
+
+    private function inCompany(?Task $task, People $company): Task
+    {
+        if (!$task || (int) $task->getProvider()?->getId() !== (int) $company->getId()) {
+            throw new \InvalidArgumentException('task_id not in company scope');
         }
 
-        $status = $this->em->getRepository(Status::class)->findOneBy([
-            'context' => 'ia',
-            'status' => 'open',
-        ]);
-        if (!$status instanceof Status) {
-            throw new \RuntimeException('Status context=ia open not seeded — run tasks migration Version20261101170000');
+        return $task;
+    }
+
+    /** Internal chats are private to their author. */
+    private function ownInternalChat(int $taskId, People $user, People $company): Task
+    {
+        $task = $this->inCompany($this->findTask($taskId), $company);
+        if ((int) $task->getRegisteredBy()?->getId() !== (int) $user->getId()) {
+            throw new \InvalidArgumentException('task_id not owned by current user');
         }
 
-        $task = new Task();
-        $task->setType('ia');
-        $task->setName(mb_substr($firstMessage, 0, 50));
-        $task->setRegisteredBy($user);
-        $task->setProvider($company);
+        return $task;
+    }
+
+    /** A customer continuing their own conversation from /ai. */
+    private function customerOwnConversation(int $taskId, People $user, People $company): Task
+    {
+        $task = $this->inCompany($this->findTask($taskId), $company);
+        if ($this->isInternalChat($task) || (int) $task->getClient()?->getId() !== (int) $user->getId()) {
+            throw new \InvalidArgumentException('Employees answer customers in CRM / Support');
+        }
+
+        return $task;
+    }
+
+    private function customerTicket(int $taskId, People $company): Task
+    {
+        $task = $this->inCompany($this->findTask($taskId), $company);
+        if ($this->isInternalChat($task) || !in_array($task->getType(), ['ia', 'relationship', 'support'], true)) {
+            throw new \InvalidArgumentException('task is not a customer conversation');
+        }
+
+        return $task;
+    }
+
+    private function newInternalChat(People $user, People $company, string $provider, string $model, string $firstMessage): Task
+    {
+        $task = $this->newTask('ia', $user, $company, $firstMessage);
         $task->setClient($user);
-        $task->setTaskStatus($status);
-        $task->setAnnounce([
-            'channel' => 'mcp',
-            'ai_provider' => $aiProvider,
-            'model' => $model,
-        ]);
-        $this->em->persist($task);
+        $task->setAnnounce(['channel' => 'mcp', 'ai_provider' => $provider, 'model' => $model]);
         $this->em->flush();
 
         return $task;
     }
 
-    private function addInteraction(
-        Task $task,
-        People $by,
-        string $type,
-        string $body,
-        string $visibility,
-        string $status = 'done',
-    ): TaskInteration {
+    private function newCustomerConversation(People $user, People $company, string $firstMessage): Task
+    {
+        $task = $this->newTask('ia', $user, $company, $firstMessage);
+        $task->setClient($user);
+        $task->setAnnounce([]);
+        $task->setAiAgent('auto');
+        $this->em->flush();
+
+        return $task;
+    }
+
+    private function newTask(string $type, People $user, People $company, string $firstMessage): Task
+    {
+        $status = $this->em->getRepository(Status::class)->findOneBy(['context' => $type, 'status' => 'open']);
+        if (!$status instanceof Status) {
+            throw new \RuntimeException("Status context={$type} open not seeded");
+        }
+        $task = new Task();
+        $task->setType($type);
+        $task->setName(mb_substr($firstMessage, 0, 50));
+        $task->setRegisteredBy($user);
+        $task->setProvider($company);
+        $task->setTaskStatus($status);
+        $this->em->persist($task);
+
+        return $task;
+    }
+
+    private function addInteraction(Task $task, People $by, string $body, string $visibility, string $status): TaskInteration
+    {
         $row = new TaskInteration();
         $row->setTask($task);
         $row->setRegisteredBy($by);
-        $row->setType($type);
+        $row->setType('comment');
         $row->setBody($body);
         $row->setVisibility($visibility);
-        if (method_exists($row, 'setStatus')) {
-            $row->setStatus($status);
-        }
+        $row->setStatus($status);
         $row->setRead(0);
         $row->setNotified(0);
         $this->em->persist($row);
 
         return $row;
-    }
-
-    /**
-     * @return list<array{role: string, content: string}>
-     */
-    private function loadHistory(Task $task): array
-    {
-        /** @var list<TaskInteration> $rows */
-        $rows = $this->em->getRepository(TaskInteration::class)->findBy(
-            ['task' => $task],
-            ['id' => 'ASC'],
-            40
-        );
-        $history = [];
-        foreach ($rows as $row) {
-            if ($row->getType() !== 'comment') {
-                continue;
-            }
-            $history[] = [
-                'role' => 'user',
-                'content' => (string) $row->getBody(),
-            ];
-        }
-
-        return $history;
-    }
-
-    /**
-     * @param array<string, mixed> $providerConfig
-     * @param list<array{role: string, content: string}> $history
-     */
-    private function runLlmWithMcpTools(string $providerKey, array $providerConfig, array $history, string $userMessage): string
-    {
-        // Gather MCP context for the model (companies + optional aggregate hint)
-        $mcpContext = '';
-        try {
-            $companies = $this->mcpServer->handle([
-                'jsonrpc' => '2.0',
-                'id' => 1,
-                'method' => 'tools/call',
-                'params' => ['name' => 'list_my_companies', 'arguments' => []],
-            ]);
-            $mcpContext = json_encode($companies['result'] ?? $companies, JSON_UNESCAPED_UNICODE);
-        } catch (\Throwable) {
-            $mcpContext = '{}';
-        }
-
-        $custom = trim((string) ($providerConfig['system_prompt'] ?? ''));
-        $system = ($custom !== '' ? $custom . "\n\n" : "")
-            . "You are the ControleOnline company assistant. Answer using MCP business data only. "
-            . "Companies in scope (JSON): {$mcpContext}. "
-            . "If you need numbers, say what query would be required. Reply in the user language.";
-
-        $historySlice = array_slice($history, -12);
-        $baseUrl = rtrim((string) ($providerConfig['base_url'] ?? 'https://api.x.ai/v1'), '/');
-        $model = (string) ($providerConfig['model'] ?? 'grok-4');
-        $apiKey = (string) $providerConfig['api_key'];
-        $providerKey = strtolower($providerKey);
-
-        if ($providerKey === 'claude' || str_contains($baseUrl, 'anthropic.com')) {
-            return $this->callClaude(
-                $baseUrl,
-                $model,
-                $apiKey,
-                $system,
-                $historySlice,
-                $userMessage,
-                (string) ($providerConfig['workspace_id'] ?? ''),
-            );
-        }
-        if ($providerKey === 'gemini' || str_contains($baseUrl, 'generativelanguage.googleapis.com')) {
-            return $this->callGemini($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
-        }
-
-        return $this->callOpenAiCompatible($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
-    }
-
-    /**
-     * @param list<array{role: string, content: string}> $historySlice
-     */
-    private function callOpenAiCompatible(
-        string $baseUrl,
-        string $model,
-        string $apiKey,
-        string $system,
-        array $historySlice,
-        string $userMessage,
-    ): string {
-        $messages = array_merge(
-            [['role' => 'system', 'content' => $system]],
-            $historySlice,
-            [['role' => 'user', 'content' => $userMessage]],
-        );
-        $decoded = $this->httpJson(
-            $baseUrl . '/chat/completions',
-            [
-                'Content-Type: application/json',
-                'Authorization: Bearer ' . $apiKey,
-            ],
-            [
-                'model' => $model,
-                'messages' => $messages,
-                'temperature' => 0.2,
-            ],
-        );
-        $text = $decoded['choices'][0]['message']['content'] ?? null;
-        if (!is_string($text) || $text === '') {
-            throw new \RuntimeException('AI provider returned empty content');
-        }
-
-        return $text;
-    }
-
-    /**
-     * @param list<array{role: string, content: string}> $historySlice
-     */
-    private function callClaude(
-        string $baseUrl,
-        string $model,
-        string $apiKey,
-        string $system,
-        array $historySlice,
-        string $userMessage,
-        string $workspaceId = '',
-    ): string {
-        $messages = [];
-        foreach ($historySlice as $row) {
-            $role = (string) ($row['role'] ?? '');
-            if ($role === 'system' || $role === '') {
-                continue;
-            }
-            if ($role !== 'user' && $role !== 'assistant') {
-                $role = 'user';
-            }
-            $messages[] = ['role' => $role, 'content' => (string) ($row['content'] ?? '')];
-        }
-        $messages[] = ['role' => 'user', 'content' => $userMessage];
-        $headers = [
-            'Content-Type: application/json',
-            'x-api-key: ' . $apiKey,
-            'anthropic-version: 2023-06-01',
-        ];
-        $workspaceId = trim($workspaceId);
-        if ($workspaceId !== '') {
-            $headers[] = 'anthropic-workspace-id: ' . $workspaceId;
-        }
-        $decoded = $this->httpJson(
-            $baseUrl . '/messages',
-            $headers,
-            [
-                'model' => $model,
-                'max_tokens' => 2048,
-                'system' => $system,
-                'messages' => $messages,
-                'temperature' => 0.2,
-            ],
-        );
-        $blocks = $decoded['content'] ?? [];
-        $text = '';
-        if (is_array($blocks)) {
-            foreach ($blocks as $block) {
-                if (is_array($block) && ($block['type'] ?? '') === 'text') {
-                    $text .= (string) ($block['text'] ?? '');
-                }
-            }
-        }
-        if ($text === '') {
-            throw new \RuntimeException('Claude returned empty content');
-        }
-
-        return $text;
-    }
-
-    /**
-     * @param list<array{role: string, content: string}> $historySlice
-     */
-    private function callGemini(
-        string $baseUrl,
-        string $model,
-        string $apiKey,
-        string $system,
-        array $historySlice,
-        string $userMessage,
-    ): string {
-        $contents = [];
-        foreach ($historySlice as $row) {
-            $role = (string) ($row['role'] ?? 'user');
-            $geminiRole = $role === 'assistant' ? 'model' : 'user';
-            $contents[] = [
-                'role' => $geminiRole,
-                'parts' => [['text' => (string) ($row['content'] ?? '')]],
-            ];
-        }
-        $contents[] = [
-            'role' => 'user',
-            'parts' => [['text' => $userMessage]],
-        ];
-        $url = rtrim($baseUrl, '/') . '/models/' . rawurlencode($model) . ':generateContent?key=' . rawurlencode($apiKey);
-        $decoded = $this->httpJson(
-            $url,
-            ['Content-Type: application/json'],
-            [
-                'systemInstruction' => ['parts' => [['text' => $system]]],
-                'contents' => $contents,
-                'generationConfig' => ['temperature' => 0.2],
-            ],
-        );
-        $text = $decoded['candidates'][0]['content']['parts'][0]['text'] ?? null;
-        if (!is_string($text) || $text === '') {
-            throw new \RuntimeException('Gemini returned empty content');
-        }
-
-        return $text;
-    }
-
-    /**
-     * @param list<string> $headers
-     * @param array<string, mixed> $body
-     * @return array<string, mixed>
-     */
-    private function httpJson(string $url, array $headers, array $body): array
-    {
-        $payload = json_encode($body, JSON_UNESCAPED_UNICODE);
-        if ($payload === false) {
-            throw new \RuntimeException('Failed to encode AI request');
-        }
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_POSTFIELDS => $payload,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 60,
-        ]);
-        $raw = curl_exec($ch);
-        $errno = curl_errno($ch);
-        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        if ($errno !== 0 || $raw === false) {
-            throw new \RuntimeException('AI provider request failed');
-        }
-        $decoded = json_decode($raw, true);
-        if ($status >= 400 || !is_array($decoded)) {
-            $snippet = is_string($raw) ? mb_substr($raw, 0, 200) : '';
-            throw new \RuntimeException('AI provider error HTTP ' . $status . ($snippet !== '' ? ': ' . $snippet : ''));
-        }
-
-        return $decoded;
     }
 }
