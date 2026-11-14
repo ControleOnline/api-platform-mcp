@@ -108,6 +108,32 @@ class McpChatController
         }
     }
 
+    #[Route('/chat/handoff', name: 'controleonline_mcp_chat_handoff', methods: ['POST', 'OPTIONS'])]
+    public function handoff(Request $request): Response
+    {
+        if ($request->getMethod() === 'OPTIONS') {
+            return new Response('', Response::HTTP_NO_CONTENT, $this->corsHeaders());
+        }
+        if (!$this->authorizationChecker->isGranted('ROLE_HUMAN')) {
+            return new JsonResponse(['error' => 'Authentication required'], Response::HTTP_UNAUTHORIZED, $this->corsHeaders());
+        }
+        $payload = json_decode($request->getContent() ?: '{}', true);
+        if (!is_array($payload) || empty($payload['task_id']) || empty($payload['type'])) {
+            return new JsonResponse(['error' => 'task_id and type are required'], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+        try {
+            $result = $this->chatService->humanHandoff(
+                (int) $payload['task_id'],
+                (string) $payload['type'],
+                isset($payload['company_id']) ? (int) $payload['company_id'] : null,
+            );
+
+            return new JsonResponse($result, Response::HTTP_OK, $this->corsHeaders());
+        } catch (\InvalidArgumentException $e) {
+            return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+    }
+
     /** @return array<string, string> */
     private function corsHeaders(): array
     {

@@ -101,7 +101,11 @@ class McpChatToolbox
         return mb_substr(implode("\n", $texts), 0, 20000);
     }
 
-    private function handoff(Task $task, People $company, array $args): string
+    /**
+     * Turns an "ia" conversation into relationship/support. Used by the AI tool and by
+     * an attendant taking over from /ai.
+     */
+    public function handoff(Task $task, People $company, array $args): string
     {
         $type = strtolower(trim((string) ($args['type'] ?? '')));
         if (!in_array($type, self::HANDOFF_TYPES, true)) {

@@ -202,6 +202,34 @@ class McpChatService
         }
     }
 
+    /**
+     * An attendant takes over a customer (WhatsApp) conversation from /ai; the AI stops answering.
+     *
+     * @return array{task_id: int, type: string}
+     */
+    public function humanHandoff(int $taskId, string $type, ?int $companyId = null): array
+    {
+        $company = $this->resolveCompany($companyId);
+        $task = $this->em->getRepository(Task::class)->find($taskId);
+        if (!$task instanceof Task || (int) $task->getProvider()?->getId() !== (int) $company->getId()) {
+            throw new \InvalidArgumentException('task_id not in company scope');
+        }
+        // Only customer conversations; internal chats are private to their author.
+        if (!in_array('via:ia', (array) $task->getAnnounce(true), true)) {
+            throw new \InvalidArgumentException('task is not a customer conversation');
+        }
+        $auth = $this->security->getUser();
+        $by = $auth instanceof User ? $auth->getPeople() : ($auth instanceof People ? $auth : null);
+
+        $this->toolbox->handoff($task, $company, [
+            'type' => $type,
+            'summary' => 'Assumido manualmente por ' . trim((string) $by?->getName()),
+        ]);
+        $this->notify($company, $task, null, ['status' => 'done', 'handoff' => $task->getType()]);
+
+        return ['task_id' => (int) $task->getId(), 'type' => (string) $task->getType()];
+    }
+
     /** @return list<array<string, mixed>> */
     public function listConfiguredProviders(?int $companyId = null): array
     {
