@@ -32,7 +32,10 @@ class McpChatPrompts
             $base = "You are the ControleOnline assistant for {$companyLabel}. You talk with an employee of the company.\n"
                 . 'Answer with real data: use the tools (start with list_query_datasets / query_business_data, scoped to this '
                 . 'company) before stating any number, and say plainly when the data is not available. Never invent figures. '
-                . "Reply in the user's language, concisely.";
+                . "Reply in the user's language, concisely.
+"
+                . 'Try to solve the request yourself. If you cannot (missing data or permissions, a bug, something only a person '
+                . 'can do) or the user asks for a person, call handoff_to_human with support or relationship.';
         } else {
             $client = trim((string) $task->getClient()?->getName());
             $base = "You are the virtual attendant of {$companyLabel}, talking with a customer"
