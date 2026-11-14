@@ -33,6 +33,7 @@ class McpChatToolbox
         private readonly EntityManagerInterface $em,
         private readonly McpServerService $mcpServer,
         private readonly StatusService $statusService,
+        private readonly ?McpChatTickets $tickets = null,
     ) {
     }
 
@@ -59,6 +60,10 @@ class McpChatToolbox
             ];
         }
 
+        if ($this->tickets !== null) {
+            $tools[] = $this->escalateDefinition();
+        }
+
         return $tools;
     }
 
@@ -72,6 +77,9 @@ class McpChatToolbox
                     'classify_task' => $this->classify($task, $args),
                     default => throw new \InvalidArgumentException("Tool not available: {$name}"),
                 };
+            }
+            if ($name === 'handoff_to_human' && $this->tickets !== null) {
+                return $this->tickets->escalate($task, $company, (string) ($args['type'] ?? ''), (string) ($args['summary'] ?? ''));
             }
             if (in_array($name, self::BLOCKED_TOOLS, true)) {
                 throw new \InvalidArgumentException("Tool not available in chat: {$name}");
@@ -204,6 +212,27 @@ class McpChatToolbox
             'description' => 'Keep the ticket classified as the conversation evolves: a clear title and, for '
                 . 'CRM/support tickets, the stage that matches what has happened so far.',
             'schema' => ['type' => 'object', 'properties' => $properties, 'additionalProperties' => false],
+        ];
+    }
+
+    /** /ai: the company's AI could not solve it -> support or sales ticket with the platform team. */
+    private function escalateDefinition(): array
+    {
+        return [
+            'name' => 'handoff_to_human',
+            'description' => 'Open a ticket with the platform team when you cannot solve the request with the data and tools '
+                . 'you have, or when the user asks for a person. Use "support" for problems, errors, access and how-to that '
+                . 'you could not resolve; use "relationship" for commercial matters (plans, prices, contracts, new features). '
+                . 'The conversation so far goes with the ticket.',
+            'schema' => [
+                'type' => 'object',
+                'properties' => [
+                    'type' => ['type' => 'string', 'enum' => self::HANDOFF_TYPES],
+                    'summary' => ['type' => 'string', 'description' => 'What the user needs and what you already tried.'],
+                ],
+                'required' => ['type', 'summary'],
+                'additionalProperties' => false,
+            ],
         ];
     }
 
