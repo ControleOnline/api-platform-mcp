@@ -33,6 +33,15 @@ services:
         autowire: true
         autoconfigure: true
 
+    ControleOnline\Service\McpChatProviderConfig:
+        autowire: true
+
+    ControleOnline\Service\McpChatLlmClient:
+        autowire: true
+
+    ControleOnline\Service\McpChatToolbox:
+        autowire: true
+
     ControleOnline\Controller\McpChatController:
         tags: ['controller.service_arguments']
 
