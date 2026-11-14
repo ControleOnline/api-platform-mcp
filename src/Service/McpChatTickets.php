@@ -6,6 +6,7 @@ namespace ControleOnline\Service;
 
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Task;
+use ControleOnline\Entity\TaskInteration;
 use Doctrine\ORM\EntityManagerInterface;
 
 /**
@@ -29,8 +30,19 @@ class McpChatTickets
     ) {
     }
 
+    private ?People $platformOverride = null;
+
+    /** Queue workers have no HTTP request: the platform resolved at enqueue time is set here. */
+    public function usePlatform(?People $platform): void
+    {
+        $this->platformOverride = $platform;
+    }
+
     public function platform(): People
     {
+        if ($this->platformOverride instanceof People) {
+            return $this->platformOverride;
+        }
         $platform = $this->domainService?->getPeopleDomain()->getPeople();
         if (!$platform instanceof People) {
             throw new \RuntimeException('Platform company not resolved for this domain');
@@ -72,6 +84,44 @@ class McpChatTickets
         $this->em->flush();
 
         return $task;
+    }
+
+    /**
+     * The company AI could not solve an /ai conversation: it becomes a support/relationship ticket of the
+     * platform (humans answer in CRM / Support). The history becomes visible to both sides.
+     */
+    public function escalate(Task $task, People $company, string $type, string $summary): string
+    {
+        $type = in_array($type, self::TYPES, true) ? $type : 'support';
+        $platform = $this->platform();
+
+        foreach ($this->em->getRepository(TaskInteration::class)->findBy(['task' => $task]) as $row) {
+            $row->setVisibility('public');
+        }
+        $task->setProvider($platform);
+        $task->setType($type);
+        $task->setTaskStatus($this->statusService->discoveryStatus('open', 'open', $type));
+        $task->setAnnounce([self::VIA_AI]);
+        $task->setAiAgent(null);
+        if (method_exists($task, 'setAlterDate')) {
+            $task->setAlterDate(new \DateTime('now'));
+        }
+
+        $note = new TaskInteration();
+        $note->setTask($task);
+        $note->setRegisteredBy($company);
+        $note->setType('comment');
+        $note->setVisibility('private');
+        $note->setBody('[IA de ' . trim((string) ($company->getAlias() ?: $company->getName())) . ' → '
+            . ($type === 'support' ? 'Suporte' : 'Comercial') . '] ' . trim($summary));
+        $note->setStatus('done');
+        $note->setRead(0);
+        $note->setNotified(0);
+        $this->em->persist($note);
+        $this->em->flush();
+
+        return 'OK: ticket opened with the ' . ($type === 'support' ? 'support' : 'sales') . ' team. Tell the user, briefly, '
+            . 'that a person from the team will continue in this same conversation.';
     }
 
     /** CRM/support tickets reached by AI need a destination: copy the client's phone/e-mail if missing. */

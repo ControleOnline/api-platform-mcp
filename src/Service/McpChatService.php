@@ -190,6 +190,8 @@ class McpChatService
         $device = trim((string) ($data['device'] ?? '')) ?: null;
         $interactionId = (int) ($data['interaction_id'] ?? 0);
         $company = $this->resolveCompany(isset($data['company_id']) ? (int) $data['company_id'] : null, skipUserScope: true);
+        $platform = isset($data['platform_id']) ? $this->em->getRepository(People::class)->find((int) $data['platform_id']) : null;
+        $this->tickets->usePlatform($platform instanceof People ? $platform : null);
         $userInteraction = $interactionId ? $this->em->getRepository(TaskInteration::class)->find($interactionId) : null;
         $userInteraction = $userInteraction instanceof TaskInteration ? $userInteraction : null;
 
@@ -220,7 +222,8 @@ class McpChatService
             ));
 
             // Customer conversations: public, so notifyClient delivers it through the ticket's connection.
-            $visibility = $channel === McpChatToolbox::CHANNEL_CUSTOMER ? 'public' : 'private';
+            // Customer conversations and /ai chats escalated to a ticket during this run are public.
+            $visibility = $channel === McpChatToolbox::CHANNEL_CUSTOMER || !$this->isInternalChat($task) ? 'public' : 'private';
             $assistant = $this->addInteraction($task, $company, $answer, $visibility, 'done');
             $this->setStatus($userInteraction, 'done', flush: false);
             if (method_exists($task, 'setAlterDate')) {
@@ -228,6 +231,10 @@ class McpChatService
             }
             $this->em->flush();
 
+            if ($channel === McpChatToolbox::CHANNEL_WEB && !$this->isInternalChat($task)) {
+                // Escalated: the platform team sees the new ticket live in CRM / Support.
+                $this->notify($task->getProvider(), $task, null, ['event' => 'conversation_message', 'status' => 'received']);
+            }
             $this->notify($company, $task, $device, [
                 'status' => 'done',
                 'interaction_id' => $assistant->getId(),
@@ -281,6 +288,7 @@ class McpChatService
             'interaction_id' => $interactionId,
             'provider' => $provider !== 'auto' ? $provider : null,
             'company_id' => $company->getId(),
+            'platform_id' => $this->platformId(),
             'device' => trim((string) $this->requestStack?->getCurrentRequest()?->headers->get('device', '')),
         ];
         if ($this->integrationService === null) {
@@ -296,6 +304,15 @@ class McpChatService
             $auth instanceof User ? $auth : null,
             $company,
         )->getId();
+    }
+
+    private function platformId(): ?int
+    {
+        try {
+            return (int) $this->tickets->platform()->getId();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /** Run as the employee who asked so MCP tools apply that user's company scope. */
