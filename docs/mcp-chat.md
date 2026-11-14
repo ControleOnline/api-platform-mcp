@@ -12,8 +12,8 @@ Issue: ControleOnline/api-platform-mcp#82 · Parent: ControleOnline/app-communit
 
 ## Modos
 
-- **Chat interno** (funcionário no /ai): Task `ia` com announce `{"channel":"mcp"}`, privada do autor. Tools MCP somente leitura, executadas como o funcionário (worker usa `Integration.user`). Websocket só para o device que perguntou.
-- **Conversa de cliente** (WhatsApp, e-mail ou cliente logado no /ai): a IA responde enquanto `tasks.ai_agent` estiver preenchido. O que a IA escreve é público e sai pela conexão da conversa. Tools: `classify_task` (título e etapa do CRM/suporte) e `handoff_to_human` (ia → relationship/support e remove a IA). Sem acesso a dados internos. Websocket para devices `MANAGER`.
+- **Chat interno** (/ai): só funcionários da empresa selecionada, com a IA **dessa** empresa (fora do escopo → erro). Task `ia` com announce `{"channel":"mcp"}`, privada do autor. Tools MCP somente leitura, executadas como o funcionário (worker usa `Integration.user`). Websocket só para o device que perguntou.
+- **Conversa de cliente** (WhatsApp ou e-mail; cliente nunca usa o /ai): a IA responde enquanto `tasks.ai_agent` estiver preenchido. O que a IA escreve é público e sai pela conexão da conversa. Tools: `classify_task` (título e etapa do CRM/suporte) e `handoff_to_human` (ia → relationship/support e remove a IA). Sem acesso a dados internos. Websocket para devices `MANAGER`.
 - **Funcionário responde o cliente** no CRM/Suporte (`POST /task_interations`, `visibility: public`): a mensagem vai ao cliente e a IA deixa a conversa.
 - **Atribuir IA** (`POST /mcp/chat/assign {task_id, instructions?, provider?}`): coloca a IA num ticket de CRM/suporte; as instruções viram nota interna e a IA faz o primeiro contato (telefone/e-mail do cliente são copiados para o ticket se faltarem).
 - **Assumir** (`POST /mcp/chat/handoff {task_id, type}`): funcionário tira a IA do ticket.
