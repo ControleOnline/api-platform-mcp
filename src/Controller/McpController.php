@@ -31,7 +31,7 @@ class McpController
      * GET returns a short discovery payload; POST handles JSON-RPC methods.
      */
     #[Route('', name: 'controleonline_mcp', methods: ['GET', 'POST', 'OPTIONS'])]
-    #[Route('/{tenantDomain}', name: 'controleonline_mcp_tenant', methods: ['GET', 'POST', 'OPTIONS'], requirements: ['tenantDomain' => '[A-Za-z0-9.-]+'])]
+    #[Route('/{tenantDomain}', name: 'controleonline_mcp_tenant', methods: ['GET', 'POST', 'OPTIONS'], requirements: ['tenantDomain' => '(?=.*\.)[A-Za-z0-9.-]+'])]
     public function __invoke(Request $request, ?string $tenantDomain = null): Response
     {
         if ($request->getMethod() === 'OPTIONS') {

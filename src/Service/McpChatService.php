@@ -5,12 +5,18 @@ declare(strict_types=1);
 namespace ControleOnline\Service;
 
 use ControleOnline\Entity\Config;
+use ControleOnline\Entity\DeviceConfig;
+use ControleOnline\Entity\Module;
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Status;
 use ControleOnline\Entity\Task;
+use ControleOnline\Entity\User;
 use ControleOnline\Entity\TaskInteration;
+use ControleOnline\Entity\Integration;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
+use ControleOnline\Service\IntegrationService;
+use ControleOnline\Service\Client\WebsocketClient;
 /**
  * Orchestrates MCP chat sessions persisted as Task(type=ia) + TaskInteration.
  * LLM provider keys stay server-side; tool calls go through McpServerService.
@@ -24,6 +30,8 @@ class McpChatService
         private readonly Security $security,
         private readonly McpServerService $mcpServer,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
+        private readonly ?IntegrationService $integrationService = null,
+        private readonly ?WebsocketClient $websocketClient = null,
     ) {
     }
 
@@ -38,7 +46,14 @@ class McpChatService
             throw new \InvalidArgumentException('message is required');
         }
 
-        $user = $this->security->getUser();
+        $auth = $this->security->getUser();
+        if ($auth instanceof People) {
+            $user = $auth;
+        } elseif ($auth instanceof User) {
+            $user = $auth->getPeople();
+        } else {
+            throw new \RuntimeException('Authenticated People user required');
+        }
         if (!$user instanceof People) {
             throw new \RuntimeException('Authenticated People user required');
         }
@@ -58,24 +73,192 @@ class McpChatService
             $message,
         );
 
-        $this->addInteraction($task, $user, 'comment', $message, 'private');
-
-        $history = $this->loadHistory($task);
-        $assistantText = $this->runLlmWithMcpTools($providerConfig, $history, $message);
-
-        // System/AI author: reuse company people as registeredBy when no dedicated bot people exists
-        $this->addInteraction($task, $company, 'comment', $assistantText, 'private');
-
-        $task->setAlterDate(new \DateTime('now'));
+        // Phase 1: persist user turn and enqueue async processing
+        $userInteraction = $this->addInteraction($task, $user, 'comment', $message, 'private', 'pending');
         $this->em->flush();
+
+        $payload = json_encode([
+            'action' => 'mcp_chat',
+            'task_id' => $task->getId(),
+            'interaction_id' => $userInteraction->getId(),
+            'provider' => $aiProvider,
+            'company_id' => $company->getId(),
+            'user_id' => $user->getId(),
+            'message' => $message,
+        ], JSON_UNESCAPED_UNICODE);
+
+        $integrationId = null;
+        if ($this->integrationService !== null) {
+            $authUser = $this->security->getUser();
+            $userEntity = $authUser instanceof User ? $authUser : null;
+            $integration = $this->integrationService->addIntegration(
+                (string) $payload,
+                'McpChat',
+                null,
+                $userEntity,
+                $company,
+            );
+            $integrationId = $integration->getId();
+        } else {
+            // Fallback sync when IntegrationService is not wired (tests)
+            $this->processQueuedChat([
+                'task_id' => $task->getId(),
+                'interaction_id' => $userInteraction->getId(),
+                'provider' => $aiProvider,
+                'company_id' => $company->getId(),
+                'message' => $message,
+            ]);
+        }
 
         return [
             'task_id' => $task->getId(),
+            'interaction_id' => $userInteraction->getId(),
+            'integration_id' => $integrationId,
             'type' => 'ia',
             'provider' => $aiProvider,
-            'message' => $assistantText,
-            'history_count' => count($history) + 2,
+            'status' => 'pending',
+            'message' => null,
+            'async' => true,
         ];
+    }
+
+    /**
+     * Integration queue handler (queueName=McpChat → ControleOnline\Service\McpChatService).
+     */
+    public function integrate(Integration $integration): void
+    {
+        $body = $integration->getBody();
+        $data = is_string($body) ? json_decode($body, true) : (is_array($body) ? $body : null);
+        if (!is_array($data)) {
+            throw new \RuntimeException('Invalid McpChat integration body');
+        }
+        $this->processQueuedChat($data);
+    }
+
+    /**
+     * Phase 2: call LLM, persist assistant turn, update statuses, push websocket.
+     *
+     * @param array<string, mixed> $data
+     */
+    public function processQueuedChat(array $data): void
+    {
+        $taskId = (int) ($data['task_id'] ?? 0);
+        $interactionId = (int) ($data['interaction_id'] ?? 0);
+        $aiProvider = strtolower((string) ($data['provider'] ?? 'grok'));
+        $companyId = isset($data['company_id']) ? (int) $data['company_id'] : null;
+        $userMessage = trim((string) ($data['message'] ?? ''));
+
+        $task = $this->em->getRepository(Task::class)->find($taskId);
+        if (!$task instanceof Task) {
+            throw new \RuntimeException('task not found for McpChat job');
+        }
+        $userInteraction = $this->em->getRepository(TaskInteration::class)->find($interactionId);
+        if ($userInteraction instanceof TaskInteration) {
+            $userInteraction->setStatus('processing');
+            $this->em->flush();
+        }
+
+        // Queue worker has no Security user — resolve company by id only
+        $company = $this->resolveCompany($companyId, skipUserScope: true);
+        $providerConfig = $this->resolveProviderConfig($company, $aiProvider);
+        if ($providerConfig === null) {
+            if ($userInteraction instanceof TaskInteration) {
+                $userInteraction->setStatus('error');
+                $this->em->flush();
+            }
+            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
+                'event' => 'mcp_chat_reply',
+                'status' => 'error',
+                'interaction_id' => $interactionId,
+                'body' => 'AI provider not configured',
+                'user_interaction_id' => $interactionId,
+            ]);
+            throw new \RuntimeException("AI provider not configured: {$aiProvider}");
+        }
+
+        try {
+            $history = $this->loadHistory($task);
+            $assistantText = $this->runLlmWithMcpTools($aiProvider, $providerConfig, $history, $userMessage !== '' ? $userMessage : (string) ($userInteraction?->getBody() ?? ''));
+            $assistant = $this->addInteraction($task, $company, 'comment', $assistantText, 'private', 'done');
+            if ($userInteraction instanceof TaskInteration) {
+                $userInteraction->setStatus('done');
+            }
+            $task->setAlterDate(new \DateTime('now'));
+            $this->em->flush();
+            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
+                'event' => 'mcp_chat_reply',
+                'status' => 'done',
+                'interaction_id' => $assistant->getId(),
+                'user_interaction_id' => $interactionId,
+                'body' => $assistant->getBody(),
+            ]);
+        } catch (\Throwable $e) {
+            if ($userInteraction instanceof TaskInteration) {
+                $userInteraction->setStatus('error');
+                $this->em->flush();
+            }
+            $this->notifyChatWebsocketEvent($company, $task, $aiProvider, [
+                'event' => 'mcp_chat_reply',
+                'status' => 'error',
+                'interaction_id' => $interactionId,
+                'user_interaction_id' => $interactionId,
+                'body' => $e->getMessage(),
+            ]);
+            throw $e;
+        }
+    }
+
+    /**
+     * Push realtime event to company devices (same shape as OrderProductRealtimeService).
+     *
+     * @param array<string, mixed> $extra
+     */
+    private function notifyChatWebsocketEvent(People $company, Task $task, string $provider, array $extra): void
+    {
+        $companyId = $company->getId();
+        $base = array_merge([
+            'store' => 'websocket',
+            'event' => 'mcp_chat_reply',
+            'company' => $companyId,
+            'companyId' => $companyId,
+            'task_id' => $task->getId(),
+            'provider' => $provider,
+            'sentAt' => date(DATE_ATOM),
+        ], $extra);
+
+        $payload = json_encode([$base], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($payload === false) {
+            return;
+        }
+
+        if ($this->websocketClient !== null) {
+            $sentDevices = [];
+            foreach ($this->em->getRepository(DeviceConfig::class)->findBy(['people' => $company]) as $deviceConfig) {
+                if (!$deviceConfig instanceof DeviceConfig || !$deviceConfig->getDevice()) {
+                    continue;
+                }
+                $device = $deviceConfig->getDevice();
+                $deviceKey = (string) ($device->getId() ?: spl_object_id($device));
+                if (isset($sentDevices[$deviceKey])) {
+                    continue;
+                }
+                $sentDevices[$deviceKey] = true;
+                try {
+                    $this->websocketClient->push($device, $payload);
+                } catch (\Throwable) {
+                    // non-fatal per device
+                }
+            }
+        }
+
+        // Fallback queue for websocket:start consumers (device optional)
+        if ($this->integrationService !== null) {
+            try {
+                $this->integrationService->addIntegration($payload, 'Websocket', null, null, $company);
+            } catch (\Throwable) {
+                // non-fatal
+            }
+        }
     }
 
     /**
@@ -116,6 +299,7 @@ class McpChatService
                 'model' => (string) ($cfg['model'] ?? ''),
                 'base_url' => (string) ($cfg['base_url'] ?? ''),
                 'system_prompt' => (string) ($cfg['system_prompt'] ?? ''),
+                'workspace_id' => (string) ($cfg['workspace_id'] ?? ''),
                 'has_key' => $keyVal !== '',
                 'api_key_masked' => $keyVal !== '' ? $this->maskKey($keyVal) : null,
             ];
@@ -152,6 +336,7 @@ class McpChatService
                 'base_url' => (string) ($incoming['base_url'] ?? $def['base_url']),
                 'api_key' => $apiKey,
                 'system_prompt' => (string) ($incoming['system_prompt'] ?? $prev['system_prompt'] ?? ''),
+                'workspace_id' => (string) ($incoming['workspace_id'] ?? $prev['workspace_id'] ?? ''),
             ];
         }
         $row = $this->findConfigRow($company);
@@ -160,7 +345,10 @@ class McpChatService
             $row->setPeople($company);
             $row->setConfigKey(self::CONFIG_KEY);
             $row->setVisibility('private');
+            $row->setModule($this->resolveConfigModule());
             $this->em->persist($row);
+        } elseif ($row->getModule() === null) {
+            $row->setModule($this->resolveConfigModule());
         }
         $row->setConfigValue(json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
         $this->em->flush();
@@ -235,14 +423,31 @@ class McpChatService
         return substr($key, 0, 4) . str_repeat('*', max(4, $len - 8)) . substr($key, -4);
     }
 
-private function resolveCompany(?int $companyId): People
+
+    private function resolveConfigModule(): Module
+    {
+        $repository = $this->em->getRepository(Module::class);
+        foreach (['mcp', 'config', 'common', 'ui-manager', 'financial'] as $moduleName) {
+            $module = $repository->findOneBy(['name' => $moduleName]);
+            if ($module instanceof Module) {
+                return $module;
+            }
+        }
+        $module = $repository->findOneBy([], ['id' => 'ASC']);
+        if ($module instanceof Module) {
+            return $module;
+        }
+        throw new \RuntimeException('No module available to attach ai-providers config.');
+    }
+
+    private function resolveCompany(?int $companyId, bool $skipUserScope = false): People
     {
         if ($companyId !== null && $companyId > 0) {
             $company = $this->em->getRepository(People::class)->find($companyId);
             if (!$company instanceof People) {
                 throw new \InvalidArgumentException('company_id not found');
             }
-            if ($this->companyScopeProvider !== null) {
+            if (!$skipUserScope && $this->companyScopeProvider !== null) {
                 $allowed = array_column($this->companyScopeProvider->listForCurrentUser(), 'id');
                 if (!in_array($companyId, $allowed, true)) {
                     throw new \InvalidArgumentException('company_id not in user scope');
@@ -321,14 +526,23 @@ private function resolveCompany(?int $companyId): People
         return $task;
     }
 
-    private function addInteraction(Task $task, People $by, string $type, string $body, string $visibility): TaskInteration
-    {
+    private function addInteraction(
+        Task $task,
+        People $by,
+        string $type,
+        string $body,
+        string $visibility,
+        string $status = 'done',
+    ): TaskInteration {
         $row = new TaskInteration();
         $row->setTask($task);
         $row->setRegisteredBy($by);
         $row->setType($type);
         $row->setBody($body);
         $row->setVisibility($visibility);
+        if (method_exists($row, 'setStatus')) {
+            $row->setStatus($status);
+        }
         $row->setRead(0);
         $row->setNotified(0);
         $this->em->persist($row);
@@ -365,7 +579,7 @@ private function resolveCompany(?int $companyId): People
      * @param array<string, mixed> $providerConfig
      * @param list<array{role: string, content: string}> $history
      */
-    private function runLlmWithMcpTools(array $providerConfig, array $history, string $userMessage): string
+    private function runLlmWithMcpTools(string $providerKey, array $providerConfig, array $history, string $userMessage): string
     {
         // Gather MCP context for the model (companies + optional aggregate hint)
         $mcpContext = '';
@@ -387,30 +601,183 @@ private function resolveCompany(?int $companyId): People
             . "Companies in scope (JSON): {$mcpContext}. "
             . "If you need numbers, say what query would be required. Reply in the user language.";
 
-        $messages = array_merge(
-            [['role' => 'system', 'content' => $system]],
-            array_slice($history, -12),
-            [['role' => 'user', 'content' => $userMessage]],
-        );
-
+        $historySlice = array_slice($history, -12);
         $baseUrl = rtrim((string) ($providerConfig['base_url'] ?? 'https://api.x.ai/v1'), '/');
         $model = (string) ($providerConfig['model'] ?? 'grok-4');
         $apiKey = (string) $providerConfig['api_key'];
+        $providerKey = strtolower($providerKey);
 
-        // OpenAI-compatible chat completions (Grok/OpenAI); Claude/Gemini adapters can extend later
-        $payload = json_encode([
-            'model' => $model,
-            'messages' => $messages,
-            'temperature' => 0.2,
-        ], JSON_UNESCAPED_UNICODE);
+        if ($providerKey === 'claude' || str_contains($baseUrl, 'anthropic.com')) {
+            return $this->callClaude(
+                $baseUrl,
+                $model,
+                $apiKey,
+                $system,
+                $historySlice,
+                $userMessage,
+                (string) ($providerConfig['workspace_id'] ?? ''),
+            );
+        }
+        if ($providerKey === 'gemini' || str_contains($baseUrl, 'generativelanguage.googleapis.com')) {
+            return $this->callGemini($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
+        }
 
-        $ch = curl_init($baseUrl . '/chat/completions');
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
+        return $this->callOpenAiCompatible($baseUrl, $model, $apiKey, $system, $historySlice, $userMessage);
+    }
+
+    /**
+     * @param list<array{role: string, content: string}> $historySlice
+     */
+    private function callOpenAiCompatible(
+        string $baseUrl,
+        string $model,
+        string $apiKey,
+        string $system,
+        array $historySlice,
+        string $userMessage,
+    ): string {
+        $messages = array_merge(
+            [['role' => 'system', 'content' => $system]],
+            $historySlice,
+            [['role' => 'user', 'content' => $userMessage]],
+        );
+        $decoded = $this->httpJson(
+            $baseUrl . '/chat/completions',
+            [
                 'Content-Type: application/json',
                 'Authorization: Bearer ' . $apiKey,
             ],
+            [
+                'model' => $model,
+                'messages' => $messages,
+                'temperature' => 0.2,
+            ],
+        );
+        $text = $decoded['choices'][0]['message']['content'] ?? null;
+        if (!is_string($text) || $text === '') {
+            throw new \RuntimeException('AI provider returned empty content');
+        }
+
+        return $text;
+    }
+
+    /**
+     * @param list<array{role: string, content: string}> $historySlice
+     */
+    private function callClaude(
+        string $baseUrl,
+        string $model,
+        string $apiKey,
+        string $system,
+        array $historySlice,
+        string $userMessage,
+        string $workspaceId = '',
+    ): string {
+        $messages = [];
+        foreach ($historySlice as $row) {
+            $role = (string) ($row['role'] ?? '');
+            if ($role === 'system' || $role === '') {
+                continue;
+            }
+            if ($role !== 'user' && $role !== 'assistant') {
+                $role = 'user';
+            }
+            $messages[] = ['role' => $role, 'content' => (string) ($row['content'] ?? '')];
+        }
+        $messages[] = ['role' => 'user', 'content' => $userMessage];
+        $headers = [
+            'Content-Type: application/json',
+            'x-api-key: ' . $apiKey,
+            'anthropic-version: 2023-06-01',
+        ];
+        $workspaceId = trim($workspaceId);
+        if ($workspaceId !== '') {
+            $headers[] = 'anthropic-workspace-id: ' . $workspaceId;
+        }
+        $decoded = $this->httpJson(
+            $baseUrl . '/messages',
+            $headers,
+            [
+                'model' => $model,
+                'max_tokens' => 2048,
+                'system' => $system,
+                'messages' => $messages,
+                'temperature' => 0.2,
+            ],
+        );
+        $blocks = $decoded['content'] ?? [];
+        $text = '';
+        if (is_array($blocks)) {
+            foreach ($blocks as $block) {
+                if (is_array($block) && ($block['type'] ?? '') === 'text') {
+                    $text .= (string) ($block['text'] ?? '');
+                }
+            }
+        }
+        if ($text === '') {
+            throw new \RuntimeException('Claude returned empty content');
+        }
+
+        return $text;
+    }
+
+    /**
+     * @param list<array{role: string, content: string}> $historySlice
+     */
+    private function callGemini(
+        string $baseUrl,
+        string $model,
+        string $apiKey,
+        string $system,
+        array $historySlice,
+        string $userMessage,
+    ): string {
+        $contents = [];
+        foreach ($historySlice as $row) {
+            $role = (string) ($row['role'] ?? 'user');
+            $geminiRole = $role === 'assistant' ? 'model' : 'user';
+            $contents[] = [
+                'role' => $geminiRole,
+                'parts' => [['text' => (string) ($row['content'] ?? '')]],
+            ];
+        }
+        $contents[] = [
+            'role' => 'user',
+            'parts' => [['text' => $userMessage]],
+        ];
+        $url = rtrim($baseUrl, '/') . '/models/' . rawurlencode($model) . ':generateContent?key=' . rawurlencode($apiKey);
+        $decoded = $this->httpJson(
+            $url,
+            ['Content-Type: application/json'],
+            [
+                'systemInstruction' => ['parts' => [['text' => $system]]],
+                'contents' => $contents,
+                'generationConfig' => ['temperature' => 0.2],
+            ],
+        );
+        $text = $decoded['candidates'][0]['content']['parts'][0]['text'] ?? null;
+        if (!is_string($text) || $text === '') {
+            throw new \RuntimeException('Gemini returned empty content');
+        }
+
+        return $text;
+    }
+
+    /**
+     * @param list<string> $headers
+     * @param array<string, mixed> $body
+     * @return array<string, mixed>
+     */
+    private function httpJson(string $url, array $headers, array $body): array
+    {
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE);
+        if ($payload === false) {
+            throw new \RuntimeException('Failed to encode AI request');
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => $headers,
             CURLOPT_POSTFIELDS => $payload,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 60,
@@ -425,14 +792,10 @@ private function resolveCompany(?int $companyId): People
         }
         $decoded = json_decode($raw, true);
         if ($status >= 400 || !is_array($decoded)) {
-            throw new \RuntimeException('AI provider error HTTP ' . $status);
+            $snippet = is_string($raw) ? mb_substr($raw, 0, 200) : '';
+            throw new \RuntimeException('AI provider error HTTP ' . $status . ($snippet !== '' ? ': ' . $snippet : ''));
         }
 
-        $text = $decoded['choices'][0]['message']['content'] ?? null;
-        if (!is_string($text) || $text === '') {
-            throw new \RuntimeException('AI provider returned empty content');
-        }
-
-        return $text;
+        return $decoded;
     }
 }

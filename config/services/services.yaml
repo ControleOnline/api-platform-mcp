@@ -26,10 +26,13 @@ services:
     ControleOnline\Controller\McpController:
         tags: ['controller.service_arguments']
 
-    # Chat MCP (Task type=ia) — provider keys via env MCP_AI_PROVIDERS JSON
+    # Chat MCP (Task type=ia) — company-scoped providers via configs
+    # public: IntegrationService resolve ContaineOnline\Service\{QueueName}Service via container->has()
     ControleOnline\Service\McpChatService:
+        public: true
         autowire: true
         autoconfigure: true
 
     ControleOnline\Controller\McpChatController:
         tags: ['controller.service_arguments']
+
