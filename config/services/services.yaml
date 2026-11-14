@@ -45,6 +45,9 @@ services:
     ControleOnline\Service\McpChatPrompts:
         autowire: true
 
+    ControleOnline\Service\McpChatTickets:
+        autowire: true
+
     ControleOnline\Controller\McpChatController:
         tags: ['controller.service_arguments']
 
