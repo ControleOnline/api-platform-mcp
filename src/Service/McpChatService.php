@@ -11,6 +11,7 @@ use ControleOnline\Entity\Task;
 use ControleOnline\Entity\TaskInteration;
 use ControleOnline\Entity\User;
 use Doctrine\ORM\EntityManagerInterface;
+use Psr\Log\LoggerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
 use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
@@ -45,6 +46,7 @@ class McpChatService
         private readonly ?ConversationRealtimeNotifier $realtime = null,
         private readonly ?TokenStorageInterface $tokenStorage = null,
         private readonly ?RequestStack $requestStack = null,
+        private readonly ?LoggerInterface $logger = null,
     ) {
     }
 
@@ -242,6 +244,12 @@ class McpChatService
                 'handoff' => $task->getAiAgent() ? null : $task->getType(),
             ]);
         } catch (\Throwable $e) {
+            $this->logger?->error('McpChat failed: ' . $e->getMessage(), [
+                'task' => $task->getId(),
+                'interaction' => $interactionId,
+                'provider' => $data['provider'] ?? null,
+                'company' => $company->getId(),
+            ]);
             $this->setStatus($userInteraction, 'error');
             $this->notify($company, $task, $device, [
                 'status' => 'error',
