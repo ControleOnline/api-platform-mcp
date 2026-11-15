@@ -38,7 +38,10 @@ class McpChatController
             (function () use ($request) {
                 $companyId = $request->query->get('company_id');
                 $cid = is_numeric($companyId) ? (int) $companyId : null;
-                return ['providers' => $this->chatService->listConfiguredProviders($cid)];
+                return [
+                    'providers' => $this->chatService->listConfiguredProviders($cid),
+                    'default' => $this->chatService->defaultProvider($cid),
+                ];
             })(),
             Response::HTTP_OK,
             $this->corsHeaders()
@@ -129,6 +132,30 @@ class McpChatController
             );
 
             return new JsonResponse($result, Response::HTTP_OK, $this->corsHeaders());
+        } catch (\InvalidArgumentException $e) {
+            return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+    }
+
+    /** Chooses which connected AI the company's /ai uses. */
+    #[Route('/chat/default', name: 'controleonline_mcp_chat_default', methods: ['PUT', 'POST', 'OPTIONS'])]
+    public function setDefault(Request $request): Response
+    {
+        if ($request->getMethod() === 'OPTIONS') {
+            return new Response('', Response::HTTP_NO_CONTENT, $this->corsHeaders());
+        }
+        if (!$this->authorizationChecker->isGranted('ROLE_HUMAN')) {
+            return new JsonResponse(['error' => 'Authentication required'], Response::HTTP_UNAUTHORIZED, $this->corsHeaders());
+        }
+        $payload = json_decode($request->getContent() ?: '{}', true);
+        if (!is_array($payload) || empty($payload['provider'])) {
+            return new JsonResponse(['error' => 'provider is required'], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
+        }
+        try {
+            return new JsonResponse($this->chatService->setDefaultProvider(
+                (string) $payload['provider'],
+                isset($payload['company_id']) ? (int) $payload['company_id'] : null,
+            ), Response::HTTP_OK, $this->corsHeaders());
         } catch (\InvalidArgumentException $e) {
             return new JsonResponse(['error' => $e->getMessage()], Response::HTTP_BAD_REQUEST, $this->corsHeaders());
         }
