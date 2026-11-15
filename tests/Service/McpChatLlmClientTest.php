@@ -39,11 +39,23 @@ final class ScriptedLlmClient extends McpChatLlmClient
     {
     }
 
+    /** Unique per client so cooldowns never leak between tests or runs; a test may share one on purpose. */
     public string $cooldownPath = '';
 
     protected function cooldownFile(): string
     {
-        return $this->cooldownPath !== '' ? $this->cooldownPath : sys_get_temp_dir() . '/mcp-test-cooldown-' . spl_object_id($this) . '.json';
+        if ($this->cooldownPath === '') {
+            $this->cooldownPath = sys_get_temp_dir() . '/mcp-test-cooldown-' . bin2hex(random_bytes(8)) . '.json';
+        }
+
+        return $this->cooldownPath;
+    }
+
+    public function __destruct()
+    {
+        if ($this->cooldownPath !== '') {
+            @unlink($this->cooldownPath);
+        }
     }
 }
 
