@@ -10,7 +10,11 @@ namespace ControleOnline\Service;
  */
 final class McpChatProviderUnavailableException extends \RuntimeException
 {
-    public function __construct(string $message, public readonly bool $modelGone = false)
+    public function __construct(
+        string $message,
+        public readonly bool $modelGone = false,
+        public readonly bool $timedOut = false,
+    )
     {
         parent::__construct($message);
     }
