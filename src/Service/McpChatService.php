@@ -13,6 +13,7 @@ use ControleOnline\Entity\User;
 use Doctrine\ORM\EntityManagerInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Bundle\SecurityBundle\Security;
+use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
 use Symfony\Component\Security\Core\Authentication\Token\UsernamePasswordToken;
@@ -204,24 +205,39 @@ class McpChatService
             return;
         }
 
+        $toolsUsed = [];
         $this->setStatus($userInteraction, 'processing');
         $this->notify($company, $task, $device, ['status' => 'processing', 'user_interaction_id' => $interactionId]);
 
         try {
-            $resolved = $this->providers->resolve($company, isset($data['provider']) ? (string) $data['provider'] : null);
-            if ($resolved === null) {
+            $candidates = $this->providers->candidates($company, isset($data['provider']) ? (string) $data['provider'] : null);
+            if ($candidates === []) {
                 throw new \RuntimeException('AI provider not configured for this company');
             }
-            [$provider, $config] = $resolved;
 
-            $answer = $this->asUser($channel === McpChatToolbox::CHANNEL_WEB ? $asUser : null, fn () => $this->llm->run(
-                $provider,
-                $config,
-                $this->prompts->system($channel, (string) ($data['trigger'] ?? 'customer'), $company, $task, (string) ($config['system_prompt'] ?? '')),
-                $this->prompts->history($this->recentInteractions($task), $company, $task, $channel),
-                $this->toolbox->definitions($channel, $task),
-                $this->toolbox->executor($channel, $task, $company),
-            ));
+            $answer = null;
+            foreach ($candidates as $i => [$provider, $config]) {
+                try {
+                    $answer = $this->asUser($channel === McpChatToolbox::CHANNEL_WEB ? $asUser : null, fn () => $this->llm->run(
+                        $provider,
+                        $config,
+                        $this->prompts->system($channel, (string) ($data['trigger'] ?? 'customer'), $company, $task, (string) ($config['system_prompt'] ?? '')),
+                        $this->prompts->history($this->recentInteractions($task), $company, $task, $channel),
+                        $this->toolbox->definitions($channel, $task),
+                        $this->keepingConnection($this->toolbox->executor($channel, $task, $company), $toolsUsed),
+                    ));
+                    break;
+                } catch (McpChatProviderUnavailableException $e) {
+                    // Next connected AI of the same company, only while no tool ran (tools may have side effects).
+                    if ($toolsUsed !== [] || $i === count($candidates) - 1) {
+                        throw $e;
+                    }
+                    $this->logger?->warning('McpChat provider unavailable, trying the next one: ' . $e->getMessage(), ['provider' => $provider]);
+                    $this->ensureConnection();
+                }
+            }
+            // The LLM can take longer than MySQL's wait_timeout (15 s on dev) with no query in between.
+            $this->ensureConnection();
 
             // Customer conversations: public, so notifyClient delivers it through the ticket's connection.
             // Customer conversations and /ai chats escalated to a ticket during this run are public.
@@ -244,11 +260,13 @@ class McpChatService
                 'handoff' => $task->getAiAgent() ? null : $task->getType(),
             ]);
         } catch (\Throwable $e) {
+            $this->ensureConnection();
             $this->logger?->error('McpChat failed: ' . $e->getMessage(), [
                 'task' => $task->getId(),
                 'interaction' => $interactionId,
                 'provider' => $data['provider'] ?? null,
                 'company' => $company->getId(),
+                'tools' => $toolsUsed,
             ]);
             $this->setStatus($userInteraction, 'error');
             $this->notify($company, $task, $device, [
@@ -328,9 +346,19 @@ class McpChatService
         }
         $previous = $this->tokenStorage->getToken();
         $this->tokenStorage->setToken(new UsernamePasswordToken($user, 'mcp_chat', $user->getRoles()));
+        // After the response (kernel.terminate) or in the worker there is no request, and the MCP read
+        // queries need one (they apply the API securityFilter through its query string).
+        $pushed = false;
+        if ($this->requestStack !== null && $this->requestStack->getCurrentRequest() === null) {
+            $this->requestStack->push(Request::create('/mcp/chat/process', 'GET'));
+            $pushed = true;
+        }
         try {
             return $fn();
         } finally {
+            if ($pushed) {
+                $this->requestStack->pop();
+            }
             $this->tokenStorage->setToken($previous);
         }
     }
@@ -365,6 +393,29 @@ class McpChatService
         );
 
         return array_reverse($rows);
+    }
+
+    /** Reconnects when the server dropped an idle connection (DBAL reconnects lazily after close()). */
+    private function ensureConnection(): void
+    {
+        $connection = $this->em->getConnection();
+        try {
+            $connection->executeQuery('SELECT 1');
+        } catch (\Throwable) {
+            $connection->close();
+        }
+    }
+
+    /** Tools run between LLM calls, after an idle period of possibly more than wait_timeout. */
+    /** @param list<string> $used tool names, in call order (logged when the run fails) */
+    private function keepingConnection(callable $executor, array &$used): callable
+    {
+        return function (string $name, array $args) use ($executor, &$used): string {
+            $used[] = $name;
+            $this->ensureConnection();
+
+            return $executor($name, $args);
+        };
     }
 
     private function setStatus(?TaskInteration $interaction, string $status, bool $flush = true): void

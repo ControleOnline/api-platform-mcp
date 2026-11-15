@@ -215,6 +215,7 @@ final class McpChatLlmClientTest extends TestCase
             self::fail('expected failure');
         } catch (\RuntimeException $e) {
             self::assertStringContainsString('unavailable after retries', $e->getMessage());
+            self::assertInstanceOf(McpChatProviderUnavailableException::class, $e, 'McpChatService falls back to the next AI on this type');
         }
         self::assertCount(2, $client->requests);
     }
@@ -269,5 +270,18 @@ final class McpChatLlmClientTest extends TestCase
         $second->run('gemini', $config, 's', [['role' => 'user', 'content' => 'q']], [], static fn () => '');
         self::assertStringContainsString('/models/gemini-3.5-flash:', $second->requests[0]['url'], 'the cooled-down model goes last');
         @unlink($path);
+    }
+
+    public function testLastRoundDisablesToolsSoTheModelAnswers(): void
+    {
+        $call = ['candidates' => [['content' => ['parts' => [['functionCall' => ['name' => 'query_business_data', 'args' => ['dataset' => 'orders']]]]]]]];
+        $client = new ScriptedLlmClient([...array_fill(0, 9, $call), ['candidates' => [['content' => ['parts' => [['text' => 'Foram 12 pedidos.']]]]]]]);
+
+        $answer = $client->run('gemini', ['base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'g', 'api_key' => 'k'], 's', [['role' => 'user', 'content' => 'pedidos?']], self::TOOLS, static fn () => '[]');
+
+        self::assertSame('Foram 12 pedidos.', $answer);
+        self::assertCount(10, $client->requests);
+        self::assertArrayNotHasKey('toolConfig', $client->requests[8]['body']);
+        self::assertSame(['functionCallingConfig' => ['mode' => 'NONE']], $client->requests[9]['body']['toolConfig']);
     }
 }
