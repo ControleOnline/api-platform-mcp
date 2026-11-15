@@ -50,6 +50,11 @@ class McpChatPrompts
             }
         }
 
+        // Models do not know today's date; without it "this month" resolves to their training cutoff.
+        $now = new \DateTimeImmutable('now', new \DateTimeZone('America/Sao_Paulo'));
+        $base .= "\nToday is " . $now->format('Y-m-d (l)') . ', time zone America/Sao_Paulo. '
+            . 'Resolve relative dates ("this month", "yesterday") from it.';
+
         return trim($custom) !== '' ? $base . "\n\nCompany instructions:\n" . trim($custom) : $base;
     }
 

@@ -13,13 +13,14 @@ namespace ControleOnline\Service;
  */
 class McpChatLlmClient
 {
-    private const MAX_ROUNDS = 8;
+    /** The last round disables tool calls so the model must answer with what it already gathered. */
+    private const MAX_ROUNDS = 10;
     private const TIMEOUT_SECONDS = 60;
     private const CONNECT_TIMEOUT_SECONDS = 10;
     /** Attempts per model before moving to the next one (transient errors only). */
     private const ATTEMPTS_PER_MODEL = 2;
     /** Used when the configured Gemini model is overloaded (503) or retired; override with config fallback_models. */
-    private const GEMINI_FALLBACK_MODELS = ['gemini-3.5-flash', 'gemini-flash-latest'];
+    private const GEMINI_FALLBACK_MODELS = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-flash-latest'];
     private const TRANSIENT_HTTP = [408, 425, 429, 500, 502, 503, 504, 529];
     /** A model that failed is tried last for this long, so the next messages start with one that works. */
     private const COOLDOWN_SECONDS = 600;
@@ -59,7 +60,8 @@ class McpChatLlmClient
 
         for ($round = 0; $round < self::MAX_ROUNDS; $round++) {
             $models = [(string) $config['model']];
-            $decoded = $this->request($models, static fn () => [$baseUrl . '/chat/completions', $headers, $body + ['messages' => $messages]]);
+            $send = $body + $this->finalRound($round, $tools, ['tool_choice' => 'none']) + ['messages' => $messages];
+            $decoded = $this->request($models, static fn () => [$baseUrl . '/chat/completions', $headers, $send]);
             $message = $decoded['choices'][0]['message'] ?? null;
             if (!is_array($message)) {
                 throw new \RuntimeException('AI provider returned no message');
@@ -98,7 +100,8 @@ class McpChatLlmClient
 
         for ($round = 0; $round < self::MAX_ROUNDS; $round++) {
             $models = [(string) $config['model']];
-            $decoded = $this->request($models, static fn () => [$baseUrl . '/messages', $headers, $body + ['messages' => $messages]]);
+            $send = $body + $this->finalRound($round, $tools, ['tool_choice' => ['type' => 'none']]) + ['messages' => $messages];
+            $decoded = $this->request($models, static fn () => [$baseUrl . '/messages', $headers, $send]);
             $blocks = is_array($decoded['content'] ?? null) ? $decoded['content'] : [];
             $stop = (string) ($decoded['stop_reason'] ?? '');
 
@@ -164,7 +167,8 @@ class McpChatLlmClient
 
         for ($round = 0; $round < self::MAX_ROUNDS; $round++) {
             // The model that answered stays first for the rest of the tool loop.
-            $decoded = $this->request($models, static fn (string $model) => [$urlFor($model), ['Content-Type: application/json'], $body + ['contents' => $contents]]);
+            $send = $body + $this->finalRound($round, $tools, ['toolConfig' => ['functionCallingConfig' => ['mode' => 'NONE']]]) + ['contents' => $contents];
+            $decoded = $this->request($models, static fn (string $model) => [$urlFor($model), ['Content-Type: application/json'], $send]);
             $content = $decoded['candidates'][0]['content'] ?? null;
             $parts = is_array($content['parts'] ?? null) ? $content['parts'] : [];
             $calls = array_values(array_filter($parts, static fn ($p) => isset($p['functionCall'])));
@@ -231,7 +235,7 @@ class McpChatLlmClient
             }
         }
 
-        throw new \RuntimeException('AI provider unavailable after retries: ' . ($last?->getMessage() ?? 'no model'), 0, $last);
+        throw new McpChatProviderUnavailableException('AI provider unavailable after retries: ' . ($last?->getMessage() ?? 'no model'));
     }
 
     /** @return list<string> */
@@ -287,6 +291,15 @@ class McpChatLlmClient
     protected function pause(int $attempt): void
     {
         sleep(2 * $attempt);
+    }
+
+    /**
+     * @param array<string, mixed> $noTools provider-specific "do not call tools" setting
+     * @return array<string, mixed>
+     */
+    private function finalRound(int $round, array $tools, array $noTools): array
+    {
+        return $tools !== [] && $round === self::MAX_ROUNDS - 1 ? $noTools : [];
     }
 
     /** Tool failures go back to the model as text so it can recover or explain. */
@@ -401,6 +414,10 @@ class McpChatLlmClient
 
         if ($errno !== 0 || !is_string($raw)) {
             throw new McpChatProviderUnavailableException('AI provider request failed (curl ' . $errno . ')', timedOut: $errno === CURLE_OPERATION_TIMEDOUT);
+        }
+        // Quota used up (429 "exceeded your current quota"): waiting does not help, move to the next model.
+        if ($status === 429 && str_contains($raw, 'quota')) {
+            throw new McpChatProviderUnavailableException('AI quota exceeded HTTP 429: ' . mb_substr($raw, 0, 200), modelGone: true);
         }
         if (in_array($status, self::TRANSIENT_HTTP, true)) {
             throw new McpChatProviderUnavailableException('AI provider busy HTTP ' . $status . ': ' . mb_substr($raw, 0, 200));

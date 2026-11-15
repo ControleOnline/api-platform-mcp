@@ -72,6 +72,28 @@ class McpChatProviderConfig
         return null;
     }
 
+    /**
+     * The chosen provider first, then the company's other connected AIs (fallback when one is down).
+     * Only this company's own AIs: a company never uses another company's AI.
+     *
+     * @return list<array{0: string, 1: array<string, mixed>}>
+     */
+    public function candidates(People $company, ?string $key): array
+    {
+        $first = $this->resolve($company, $key);
+        if ($first === null) {
+            return [];
+        }
+        $out = [$first];
+        foreach ($this->load($company) as $name => $cfg) {
+            if ($name !== $first[0] && $this->isUsable($cfg)) {
+                $out[] = [$name, $cfg];
+            }
+        }
+
+        return $out;
+    }
+
     /** Provider /ai uses when none is chosen (null = first usable). */
     public function getDefault(People $company): ?string
     {
