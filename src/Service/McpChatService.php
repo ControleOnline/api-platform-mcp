@@ -40,8 +40,8 @@ class McpChatService
         private readonly McpChatToolbox $toolbox,
         private readonly McpChatPrompts $prompts,
         private readonly McpChatTickets $tickets,
+        private readonly ?McpChatQueue $queue = null,
         private readonly ?McpCompanyScopeProviderInterface $companyScopeProvider = null,
-        private readonly ?IntegrationService $integrationService = null,
         private readonly ?ConversationRealtimeNotifier $realtime = null,
         private readonly ?TokenStorageInterface $tokenStorage = null,
         private readonly ?RequestStack $requestStack = null,
@@ -252,6 +252,17 @@ class McpChatService
         }
     }
 
+    /** @return array{default: string} */
+    public function setDefaultProvider(string $provider, ?int $companyId = null): array
+    {
+        return $this->providers->setDefault($this->resolveCompany($companyId), $provider);
+    }
+
+    public function defaultProvider(?int $companyId = null): ?string
+    {
+        return $this->providers->resolve($this->resolveCompany($companyId), null)[0] ?? null;
+    }
+
     /** @return list<array<string, mixed>> */
     public function listConfiguredProviders(?int $companyId = null): array
     {
@@ -288,31 +299,17 @@ class McpChatService
             'interaction_id' => $interactionId,
             'provider' => $provider !== 'auto' ? $provider : null,
             'company_id' => $company->getId(),
-            'platform_id' => $this->platformId(),
+            'platform_id' => $this->tickets->platformId(),
             'device' => trim((string) $this->requestStack?->getCurrentRequest()?->headers->get('device', '')),
         ];
-        if ($this->integrationService === null) {
+        if ($this->queue === null) {
             $this->processQueuedChat($job); // tests / no queue wired
 
             return null;
         }
 
-        return $this->integrationService->addIntegration(
-            (string) json_encode($job, JSON_UNESCAPED_UNICODE),
-            'McpChat',
-            null,
-            $auth instanceof User ? $auth : null,
-            $company,
-        )->getId();
-    }
-
-    private function platformId(): ?int
-    {
-        try {
-            return (int) $this->tickets->platform()->getId();
-        } catch (\Throwable) {
-            return null;
-        }
+        // Runs right after the response; the worker is only the fallback.
+        return $this->queue->add($job, $company, $auth instanceof User ? $auth : null);
     }
 
     /** Run as the employee who asked so MCP tools apply that user's company scope. */
