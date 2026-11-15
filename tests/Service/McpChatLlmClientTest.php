@@ -38,6 +38,13 @@ final class ScriptedLlmClient extends McpChatLlmClient
     protected function pause(int $attempt): void
     {
     }
+
+    public string $cooldownPath = '';
+
+    protected function cooldownFile(): string
+    {
+        return $this->cooldownPath !== '' ? $this->cooldownPath : sys_get_temp_dir() . '/mcp-test-cooldown-' . spl_object_id($this) . '.json';
+    }
 }
 
 final class McpChatLlmClientTest extends TestCase
@@ -198,5 +205,57 @@ final class McpChatLlmClientTest extends TestCase
             self::assertStringContainsString('unavailable after retries', $e->getMessage());
         }
         self::assertCount(2, $client->requests);
+    }
+
+    public function testGeminiSchemaKeepsOnlySupportedKeywords(): void
+    {
+        $tools = [[
+            'name' => 'query_business_data',
+            'description' => 'Query data',
+            'schema' => [
+                '$schema' => 'https://json-schema.org/draft/2020-12/schema',
+                'type' => 'object',
+                'additionalProperties' => false,
+                'properties' => [
+                    'fields' => ['type' => 'array', 'uniqueItems' => true, 'items' => ['type' => 'string', 'default' => 'id']],
+                    'limit' => ['type' => ['integer', 'null'], 'minimum' => 1, 'default' => 20],
+                    'mode' => ['const' => 'read'],
+                    'page' => ['type' => 'integer', 'enum' => [1, 2]],
+                    'filter' => ['type' => 'object', 'additionalProperties' => ['type' => 'string'], 'properties' => ['uniqueItems' => ['type' => 'string']]],
+                ],
+                'required' => ['fields', 'ghost'],
+            ],
+        ]];
+        $client = new ScriptedLlmClient([['candidates' => [['content' => ['parts' => [['text' => 'ok']]]]]]]);
+
+        $client->run('gemini', ['base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'g', 'api_key' => 'k'], 's', [['role' => 'user', 'content' => 'q']], $tools, static fn () => '');
+
+        $params = $client->requests[0]['body']['tools'][0]['functionDeclarations'][0]['parameters'];
+        self::assertSame(['type', 'properties', 'required'], array_keys($params));
+        self::assertSame(['type' => 'array', 'items' => ['type' => 'string']], $params['properties']['fields']);
+        self::assertSame(['type' => 'integer', 'minimum' => 1, 'nullable' => true], $params['properties']['limit']);
+        self::assertSame(['enum' => ['read']], $params['properties']['mode']);
+        self::assertSame(['type' => 'integer'], $params['properties']['page']);
+        // A property *named* like a keyword is kept.
+        self::assertSame(['uniqueItems' => ['type' => 'string']], $params['properties']['filter']['properties']);
+        self::assertSame(['fields'], $params['required']);
+    }
+
+    public function testTimedOutModelIsSkippedAndCooledDownForTheNextMessage(): void
+    {
+        $path = sys_get_temp_dir() . '/mcp-test-cooldown-' . uniqid() . '.json';
+        $config = ['base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'gemini-3.8-flash', 'api_key' => 'k', 'fallback_models' => ['gemini-3.5-flash']];
+        $ok = ['candidates' => [['content' => ['parts' => [['text' => 'ok']]]]]];
+
+        $first = new ScriptedLlmClient([new McpChatProviderUnavailableException('AI provider request failed (curl 28)', timedOut: true), $ok]);
+        $first->cooldownPath = $path;
+        self::assertSame('ok', $first->run('gemini', $config, 's', [['role' => 'user', 'content' => 'q']], [], static fn () => ''));
+        self::assertCount(2, $first->requests, 'a timeout is not retried on the same model');
+
+        $second = new ScriptedLlmClient([$ok]);
+        $second->cooldownPath = $path;
+        $second->run('gemini', $config, 's', [['role' => 'user', 'content' => 'q']], [], static fn () => '');
+        self::assertStringContainsString('/models/gemini-3.5-flash:', $second->requests[0]['url'], 'the cooled-down model goes last');
+        @unlink($path);
     }
 }
