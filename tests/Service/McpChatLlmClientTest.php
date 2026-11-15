@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ControleOnline\Mcp\Tests\Service;
 
 use ControleOnline\Service\McpChatLlmClient;
+use ControleOnline\Service\McpChatProviderUnavailableException;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -15,7 +16,7 @@ final class ScriptedLlmClient extends McpChatLlmClient
     /** @var list<array{url: string, headers: list<string>, body: array<string, mixed>}> */
     public array $requests = [];
 
-    /** @param list<array<string, mixed>> $responses */
+    /** @param list<array<string, mixed>|\Throwable> $responses */
     public function __construct(private array $responses)
     {
     }
@@ -26,7 +27,16 @@ final class ScriptedLlmClient extends McpChatLlmClient
         $this->requests[] = ['url' => $url, 'headers' => $headers, 'body' => json_decode((string) json_encode($body), true)];
         $this->requests[array_key_last($this->requests)]['raw'] = (string) json_encode($body);
 
-        return array_shift($this->responses) ?? throw new \LogicException('No scripted response left');
+        $next = array_shift($this->responses) ?? throw new \LogicException('No scripted response left');
+        if ($next instanceof \Throwable) {
+            throw $next;
+        }
+
+        return $next;
+    }
+
+    protected function pause(int $attempt): void
+    {
     }
 }
 
@@ -133,5 +143,60 @@ final class McpChatLlmClientTest extends TestCase
         $contents = $client->requests[1]['body']['contents'];
         self::assertSame('done', $contents[2]['parts'][0]['functionResponse']['response']['result']);
         self::assertStringContainsString('"args":{}', $client->requests[1]['raw']);
+    }
+
+    public function testGeminiFallsBackToNextModelWhenOverloaded(): void
+    {
+        $busy = static fn () => new McpChatProviderUnavailableException('AI provider busy HTTP 503');
+        $client = new ScriptedLlmClient([
+            $busy(),
+            $busy(),
+            ['candidates' => [['content' => ['parts' => [['functionCall' => ['name' => 'list_query_datasets', 'args' => []]]]]]]],
+            ['candidates' => [['content' => ['parts' => [['text' => 'ok']]]]]],
+        ]);
+
+        $answer = $client->run(
+            'gemini',
+            ['base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'gemini-3.8-flash', 'api_key' => 'k', 'fallback_models' => 'gemini-3.5-flash'],
+            'system',
+            [['role' => 'user', 'content' => 'oi']],
+            self::TOOLS,
+            static fn () => '[]',
+        );
+
+        self::assertSame('ok', $answer);
+        $models = array_map(static fn (array $r) => preg_replace('#^.*/models/([^:]+):.*$#', '$1', $r['url']), $client->requests);
+        // Two attempts on the overloaded model, then the fallback, which stays first for the next round.
+        self::assertSame(['gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.5-flash'], $models);
+    }
+
+    public function testRetiredGeminiModelSkipsStraightToFallback(): void
+    {
+        $client = new ScriptedLlmClient([
+            new McpChatProviderUnavailableException('AI model unavailable HTTP 404', modelGone: true),
+            ['candidates' => [['content' => ['parts' => [['text' => 'ok']]]]]],
+        ]);
+
+        $answer = $client->run('gemini', ['base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'gemini-2.0-flash', 'api_key' => 'k'], 's', [['role' => 'user', 'content' => 'oi']], [], static fn () => '');
+
+        self::assertSame('ok', $answer);
+        self::assertCount(2, $client->requests);
+        self::assertStringContainsString('/models/gemini-3.5-flash:', $client->requests[1]['url']);
+    }
+
+    public function testTransientErrorIsRetriedOnceThenReported(): void
+    {
+        $client = new ScriptedLlmClient([
+            new McpChatProviderUnavailableException('AI provider busy HTTP 529'),
+            new McpChatProviderUnavailableException('AI provider busy HTTP 529'),
+        ]);
+
+        try {
+            $client->run('claude', ['base_url' => 'https://api.anthropic.com/v1', 'model' => 'claude-opus-5-5', 'api_key' => 'k'], 's', [['role' => 'user', 'content' => 'oi']], [], static fn () => '');
+            self::fail('expected failure');
+        } catch (\RuntimeException $e) {
+            self::assertStringContainsString('unavailable after retries', $e->getMessage());
+        }
+        self::assertCount(2, $client->requests);
     }
 }

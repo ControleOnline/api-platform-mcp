@@ -14,7 +14,13 @@ namespace ControleOnline\Service;
 class McpChatLlmClient
 {
     private const MAX_ROUNDS = 8;
-    private const TIMEOUT_SECONDS = 180;
+    private const TIMEOUT_SECONDS = 60;
+    private const CONNECT_TIMEOUT_SECONDS = 10;
+    /** Attempts per model before moving to the next one (transient errors only). */
+    private const ATTEMPTS_PER_MODEL = 2;
+    /** Used when the configured Gemini model is overloaded (503) or retired; override with config fallback_models. */
+    private const GEMINI_FALLBACK_MODELS = ['gemini-3.5-flash', 'gemini-flash-latest'];
+    private const TRANSIENT_HTTP = [408, 425, 429, 500, 502, 503, 504, 529];
 
     /**
      * @param array<string, mixed> $config provider config (base_url, model, api_key, workspace_id)
@@ -50,7 +56,8 @@ class McpChatLlmClient
         $headers = ['Content-Type: application/json', 'Authorization: Bearer ' . $config['api_key']];
 
         for ($round = 0; $round < self::MAX_ROUNDS; $round++) {
-            $decoded = $this->httpJson($baseUrl . '/chat/completions', $headers, $body + ['messages' => $messages]);
+            $models = [(string) $config['model']];
+            $decoded = $this->request($models, static fn () => [$baseUrl . '/chat/completions', $headers, $body + ['messages' => $messages]]);
             $message = $decoded['choices'][0]['message'] ?? null;
             if (!is_array($message)) {
                 throw new \RuntimeException('AI provider returned no message');
@@ -88,7 +95,8 @@ class McpChatLlmClient
         $messages = $this->mergeSameRole($history);
 
         for ($round = 0; $round < self::MAX_ROUNDS; $round++) {
-            $decoded = $this->httpJson($baseUrl . '/messages', $headers, $body + ['messages' => $messages]);
+            $models = [(string) $config['model']];
+            $decoded = $this->request($models, static fn () => [$baseUrl . '/messages', $headers, $body + ['messages' => $messages]]);
             $blocks = is_array($decoded['content'] ?? null) ? $decoded['content'] : [];
             $stop = (string) ($decoded['stop_reason'] ?? '');
 
@@ -149,10 +157,12 @@ class McpChatLlmClient
                 return $declaration;
             }, $tools)]];
         }
-        $url = $baseUrl . '/models/' . rawurlencode((string) $config['model']) . ':generateContent?key=' . rawurlencode((string) $config['api_key']);
+        $models = $this->geminiModels($config);
+        $urlFor = static fn (string $model) => $baseUrl . '/models/' . rawurlencode($model) . ':generateContent?key=' . rawurlencode((string) $config['api_key']);
 
         for ($round = 0; $round < self::MAX_ROUNDS; $round++) {
-            $decoded = $this->httpJson($url, ['Content-Type: application/json'], $body + ['contents' => $contents]);
+            // The model that answered stays first for the rest of the tool loop.
+            $decoded = $this->request($models, static fn (string $model) => [$urlFor($model), ['Content-Type: application/json'], $body + ['contents' => $contents]]);
             $content = $decoded['candidates'][0]['content'] ?? null;
             $parts = is_array($content['parts'] ?? null) ? $content['parts'] : [];
             $calls = array_values(array_filter($parts, static fn ($p) => isset($p['functionCall'])));
@@ -179,6 +189,60 @@ class McpChatLlmClient
         }
 
         throw new \RuntimeException('AI tool loop exceeded ' . self::MAX_ROUNDS . ' rounds');
+    }
+
+    /**
+     * Calls the provider, retrying transient failures (overload, rate limit, timeout) and then trying the
+     * next model. $models is reordered so the model that answered is tried first on the next round.
+     *
+     * @param list<string> $models
+     * @param callable(string): array{0: string, 1: list<string>, 2: array<string, mixed>} $build url, headers, body
+     * @return array<string, mixed>
+     */
+    private function request(array &$models, callable $build): array
+    {
+        $last = null;
+        foreach ($models as $i => $model) {
+            for ($attempt = 1; $attempt <= self::ATTEMPTS_PER_MODEL; $attempt++) {
+                try {
+                    [$url, $headers, $body] = $build($model);
+                    $decoded = $this->httpJson($url, $headers, $body);
+                    if ($i > 0) {
+                        array_splice($models, $i, 1);
+                        array_unshift($models, $model);
+                    }
+
+                    return $decoded;
+                } catch (McpChatProviderUnavailableException $e) {
+                    $last = $e;
+                    if ($e->modelGone) {
+                        break; // retired model: go to the next one right away
+                    }
+                    if ($attempt < self::ATTEMPTS_PER_MODEL) {
+                        $this->pause($attempt);
+                    }
+                }
+            }
+        }
+
+        throw new \RuntimeException('AI provider unavailable after retries: ' . ($last?->getMessage() ?? 'no model'), 0, $last);
+    }
+
+    /** @return list<string> */
+    private function geminiModels(array $config): array
+    {
+        $fallback = $config['fallback_models'] ?? self::GEMINI_FALLBACK_MODELS;
+        $fallback = is_string($fallback) ? (preg_split('/[\s,]+/', $fallback) ?: []) : (array) $fallback;
+
+        return array_values(array_unique(array_filter(array_map(
+            static fn ($m) => trim((string) $m),
+            [(string) ($config['model'] ?? ''), ...$fallback],
+        ))));
+    }
+
+    protected function pause(int $attempt): void
+    {
+        sleep(2 * $attempt);
     }
 
     /** Tool failures go back to the model as text so it can recover or explain. */
@@ -256,13 +320,21 @@ class McpChatLlmClient
             CURLOPT_POSTFIELDS => $payload,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => self::TIMEOUT_SECONDS,
+            CURLOPT_CONNECTTIMEOUT => self::CONNECT_TIMEOUT_SECONDS,
         ]);
         $raw = curl_exec($ch);
         $errno = curl_errno($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
         if ($errno !== 0 || !is_string($raw)) {
-            throw new \RuntimeException('AI provider request failed (curl ' . $errno . ')');
+            throw new McpChatProviderUnavailableException('AI provider request failed (curl ' . $errno . ')');
+        }
+        if (in_array($status, self::TRANSIENT_HTTP, true)) {
+            throw new McpChatProviderUnavailableException('AI provider busy HTTP ' . $status . ': ' . mb_substr($raw, 0, 200));
+        }
+        // Gemini answers 404 for retired models ("no longer available"): move to the fallback model.
+        if ($status === 404 && str_contains($url, 'generativelanguage.googleapis.com')) {
+            throw new McpChatProviderUnavailableException('AI model unavailable HTTP 404: ' . mb_substr($raw, 0, 200), modelGone: true);
         }
         $decoded = json_decode($raw, true);
         if ($status >= 400 || !is_array($decoded)) {
