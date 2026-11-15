@@ -21,6 +21,8 @@ class McpChatLlmClient
     /** Used when the configured Gemini model is overloaded (503) or retired; override with config fallback_models. */
     private const GEMINI_FALLBACK_MODELS = ['gemini-3.5-flash', 'gemini-flash-latest'];
     private const TRANSIENT_HTTP = [408, 425, 429, 500, 502, 503, 504, 529];
+    /** A model that failed is tried last for this long, so the next messages start with one that works. */
+    private const COOLDOWN_SECONDS = 600;
 
     /**
      * @param array<string, mixed> $config provider config (base_url, model, api_key, workspace_id)
@@ -201,6 +203,7 @@ class McpChatLlmClient
      */
     private function request(array &$models, callable $build): array
     {
+        $models = $this->byCooldown($models);
         $last = null;
         foreach ($models as $i => $model) {
             for ($attempt = 1; $attempt <= self::ATTEMPTS_PER_MODEL; $attempt++) {
@@ -215,8 +218,11 @@ class McpChatLlmClient
                     return $decoded;
                 } catch (McpChatProviderUnavailableException $e) {
                     $last = $e;
-                    if ($e->modelGone) {
-                        break; // retired model: go to the next one right away
+                    if (count($models) > 1) {
+                        $this->coolDown($model);
+                    }
+                    if ($e->modelGone || ($e->timedOut && count($models) > 1)) {
+                        break; // retired or hanging model: go to the next one right away
                     }
                     if ($attempt < self::ATTEMPTS_PER_MODEL) {
                         $this->pause($attempt);
@@ -238,6 +244,44 @@ class McpChatLlmClient
             static fn ($m) => trim((string) $m),
             [(string) ($config['model'] ?? ''), ...$fallback],
         ))));
+    }
+
+    /**
+     * @param list<string> $models
+     * @return list<string> models cooling down moved to the end, original order otherwise
+     */
+    private function byCooldown(array $models): array
+    {
+        if (count($models) < 2) {
+            return $models;
+        }
+        $cool = $this->cooldowns();
+        $ready = array_values(array_filter($models, static fn ($m) => ($cool[$m] ?? 0) <= time()));
+        $waiting = array_values(array_filter($models, static fn ($m) => ($cool[$m] ?? 0) > time()));
+
+        return [...$ready, ...$waiting];
+    }
+
+    private function coolDown(string $model): void
+    {
+        $cool = array_filter($this->cooldowns(), static fn ($until) => $until > time());
+        $cool[$model] = time() + self::COOLDOWN_SECONDS;
+        @file_put_contents($this->cooldownFile(), (string) json_encode($cool), LOCK_EX);
+    }
+
+    /** @return array<string, int> */
+    protected function cooldowns(): array
+    {
+        $raw = @file_get_contents($this->cooldownFile());
+        $cool = is_string($raw) ? json_decode($raw, true) : null;
+
+        return is_array($cool) ? array_map('intval', $cool) : [];
+    }
+
+    protected function cooldownFile(): string
+    {
+        // Per OS user: environments sharing a host (and /tmp) must not fight over file permissions.
+        return sys_get_temp_dir() . '/controleonline-mcp-ai-cooldown-' . (function_exists('posix_geteuid') ? posix_geteuid() : 0) . '.json';
     }
 
     protected function pause(int $attempt): void
@@ -275,15 +319,44 @@ class McpChatLlmClient
     }
 
     /** Gemini's OpenAPI subset rejects JSON-Schema keywords such as additionalProperties. */
+    /** Keywords Gemini's function-declaration schema (OpenAPI subset) accepts; anything else is a 400. */
+    private const GEMINI_SCHEMA_KEYS = [
+        'type', 'format', 'title', 'description', 'nullable', 'enum', 'properties', 'required', 'items',
+        'anyOf', 'minItems', 'maxItems', 'minimum', 'maximum', 'minLength', 'maxLength', 'pattern',
+    ];
+
     private function geminiSchema(array $schema): array
     {
         $schema = json_decode((string) json_encode($schema), true) ?: [];
         $clean = static function (array $node) use (&$clean): array {
-            unset($node['additionalProperties'], $node['$schema']);
-            foreach ($node as $k => $v) {
-                if (is_array($v)) {
-                    $node[$k] = $clean($v);
+            if (isset($node['const']) && !isset($node['enum'])) {
+                $node['enum'] = [$node['const']];
+            }
+            if (is_array($node['type'] ?? null)) {
+                // ["string", "null"] -> type string + nullable
+                $types = array_values(array_filter($node['type'], static fn ($t) => $t !== 'null'));
+                if (count($types) < count($node['type'])) {
+                    $node['nullable'] = true;
                 }
+                $node['type'] = $types[0] ?? 'string';
+            }
+            if (isset($node['enum']) && (!is_array($node['enum']) || array_filter($node['enum'], static fn ($v) => !is_string($v)) !== [])) {
+                unset($node['enum']); // Gemini only takes string enums
+            }
+            $node = array_intersect_key($node, array_flip(self::GEMINI_SCHEMA_KEYS));
+            if (is_array($node['properties'] ?? null)) {
+                foreach ($node['properties'] as $name => $child) {
+                    $node['properties'][$name] = is_array($child) ? $clean($child) : ['type' => 'string'];
+                }
+                if (is_array($node['required'] ?? null)) {
+                    $node['required'] = array_values(array_filter($node['required'], static fn ($r) => isset($node['properties'][$r])));
+                }
+            }
+            if (is_array($node['items'] ?? null)) {
+                $node['items'] = $clean($node['items']);
+            }
+            if (is_array($node['anyOf'] ?? null)) {
+                $node['anyOf'] = array_map(static fn ($n) => is_array($n) ? $clean($n) : $n, $node['anyOf']);
             }
 
             return $node;
@@ -327,7 +400,7 @@ class McpChatLlmClient
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
         if ($errno !== 0 || !is_string($raw)) {
-            throw new McpChatProviderUnavailableException('AI provider request failed (curl ' . $errno . ')');
+            throw new McpChatProviderUnavailableException('AI provider request failed (curl ' . $errno . ')', timedOut: $errno === CURLE_OPERATION_TIMEDOUT);
         }
         if (in_array($status, self::TRANSIENT_HTTP, true)) {
             throw new McpChatProviderUnavailableException('AI provider busy HTTP ' . $status . ': ' . mb_substr($raw, 0, 200));
