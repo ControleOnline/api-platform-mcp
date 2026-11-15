@@ -76,10 +76,8 @@ class McpChatLlmClient
     private function runClaude(string $baseUrl, array $config, string $system, array $history, array $tools, callable $executor): string
     {
         $headers = ['Content-Type: application/json', 'x-api-key: ' . $config['api_key'], 'anthropic-version: 2023-06-01'];
-        $workspace = trim((string) ($config['workspace_id'] ?? ''));
-        if ($workspace !== '') {
-            $headers[] = 'anthropic-workspace-id: ' . $workspace;
-        }
+        // The API key already selects the workspace; an anthropic-workspace-id header with a stale id
+        // makes every request fail (400), so it is never sent.
         // Current Claude models reject sampling params (temperature/top_p); thinking stays at model default.
         $body = ['model' => (string) $config['model'], 'max_tokens' => 16000, 'system' => $system];
         if ($tools !== []) {
