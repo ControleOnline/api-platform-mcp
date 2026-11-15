@@ -268,9 +268,22 @@ class McpChatService
                 'company' => $company->getId(),
                 'tools' => $toolsUsed,
             ]);
-            $this->setStatus($userInteraction, 'error');
+            $note = null;
+            try {
+                // Persisted so the failure is visible after a reload, not only in the WebSocket event.
+                // /ai (internal chat): a short message to the user. Customer conversations: a private
+                // note for the team only — the customer never sees errors.
+                $note = $channel === McpChatToolbox::CHANNEL_WEB
+                    ? $this->addInteraction($task, $company, 'Não consegui responder agora. Tente novamente em instantes.', 'private', 'error')
+                    : $this->addInteraction($task, $company, '[Interno] Falha na resposta automática: ' . mb_substr($e->getMessage(), 0, 300), 'private', 'error');
+                $this->setStatus($userInteraction, 'error', flush: false);
+                $this->em->flush();
+            } catch (\Throwable) {
+                $note = null;
+            }
             $this->notify($company, $task, $device, [
                 'status' => 'error',
+                'interaction_id' => $note?->getId(),
                 'user_interaction_id' => $interactionId,
                 'body' => mb_substr($e->getMessage(), 0, 300),
             ]);
