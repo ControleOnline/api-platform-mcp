@@ -51,6 +51,16 @@ class McpChatTickets
         return $platform;
     }
 
+    /** Platform id for queue jobs (null when the domain has no platform company). */
+    public function platformId(): ?int
+    {
+        try {
+            return (int) $this->platform()->getId();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
     /** A ticket the user opened (they are its client); never an internal chat. */
     public function findOwn(int $taskId, People $user): ?Task
     {

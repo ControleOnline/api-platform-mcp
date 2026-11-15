@@ -16,10 +16,14 @@ use Doctrine\ORM\EntityManagerInterface;
 class McpChatProviderConfig
 {
     public const CONFIG_KEY = 'ai-providers';
+    /** Key inside the ai-providers JSON holding the provider /ai uses by default. */
+    public const DEFAULT_KEY = '_default';
 
     /** Model ids that were shipped as defaults but are not valid API model ids. */
     private const LEGACY_MODEL_ALIASES = [
         'claude' => ['claude-sonnet-4' => 'claude-opus-5-5'],
+        // Retired by Google ("no longer available").
+        'gemini' => ['gemini-2.0-flash' => 'gemini-3.8-flash'],
     ];
 
     public function __construct(private readonly EntityManagerInterface $em)
@@ -32,7 +36,7 @@ class McpChatProviderConfig
         return [
             'grok' => ['label' => 'Grok', 'base_url' => 'https://api.x.ai/v1', 'model' => 'grok-4'],
             'openai' => ['label' => 'Codex / OpenAI', 'base_url' => 'https://api.openai.com/v1', 'model' => 'gpt-4o'],
-            'gemini' => ['label' => 'Gemini', 'base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'gemini-2.0-flash'],
+            'gemini' => ['label' => 'Gemini', 'base_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model' => 'gemini-3.8-flash'],
             'claude' => ['label' => 'Claude', 'base_url' => 'https://api.anthropic.com/v1', 'model' => 'claude-opus-5-5'],
         ];
     }
@@ -47,6 +51,12 @@ class McpChatProviderConfig
     {
         $all = $this->load($company);
         $key = $key !== null ? strtolower(trim($key)) : '';
+        if ($key === '' || $key === 'auto') {
+            $key = (string) $this->getDefault($company);
+            if (!$this->isUsable($all[$key] ?? null)) {
+                $key = '';
+            }
+        }
         if ($key !== '' && $this->isUsable($all[$key] ?? null)) {
             return [$key, $all[$key]];
         }
@@ -62,9 +72,35 @@ class McpChatProviderConfig
         return null;
     }
 
+    /** Provider /ai uses when none is chosen (null = first usable). */
+    public function getDefault(People $company): ?string
+    {
+        $raw = $this->raw($company);
+        $default = is_string($raw[self::DEFAULT_KEY] ?? null) ? $raw[self::DEFAULT_KEY] : null;
+
+        return $default !== null && isset($this->defaultProviders()[$default]) ? $default : null;
+    }
+
+    /** @return array{default: string} */
+    public function setDefault(People $company, string $key): array
+    {
+        $key = strtolower(trim($key));
+        if (!$this->isUsable($this->load($company)[$key] ?? null)) {
+            throw new \InvalidArgumentException('AI provider not connected for this company: ' . $key);
+        }
+        $row = $this->findRow($company);
+        $raw = $this->raw($company);
+        $raw[self::DEFAULT_KEY] = $key;
+        $row->setConfigValue((string) json_encode($raw, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        $this->em->flush();
+
+        return ['default' => $key];
+    }
+
     /** @return list<array<string, mixed>> */
     public function listConfigured(People $company): array
     {
+        $default = $this->resolve($company, null)[0] ?? null;
         $out = [];
         foreach ($this->load($company) as $key => $cfg) {
             if (!$this->isUsable($cfg)) {
@@ -75,6 +111,7 @@ class McpChatProviderConfig
                 'label' => (string) ($cfg['label'] ?? $key),
                 'model' => (string) ($cfg['model'] ?? ''),
                 'enabled' => true,
+                'default' => $key === $default,
                 'has_key' => true,
                 'api_key_masked' => $this->mask((string) $cfg['api_key']),
             ];
@@ -105,6 +142,7 @@ class McpChatProviderConfig
             'company_id' => (int) $company->getId(),
             'config_id' => $this->findRow($company)?->getId(),
             'config_key' => self::CONFIG_KEY,
+            'default' => $this->getDefault($company),
             'providers' => $masked,
         ];
     }
@@ -135,6 +173,10 @@ class McpChatProviderConfig
             ];
         }
 
+        $previousDefault = $this->getDefault($company);
+        if ($previousDefault !== null) {
+            $merged[self::DEFAULT_KEY] = $previousDefault;
+        }
         $row = $this->findRow($company);
         if ($row === null) {
             $row = new Config();
@@ -152,15 +194,19 @@ class McpChatProviderConfig
         return ['config_id' => (int) $row->getId()];
     }
 
+    /** @return array<string, mixed> */
+    private function raw(People $company): array
+    {
+        $row = $this->findRow($company);
+        $decoded = $row !== null ? json_decode((string) $row->getConfigValue(), true) : null;
+
+        return is_array($decoded) ? $decoded : [];
+    }
+
     /** @return array<string, array<string, mixed>> */
     private function load(People $company): array
     {
-        $raw = [];
-        $row = $this->findRow($company);
-        if ($row !== null) {
-            $decoded = json_decode((string) $row->getConfigValue(), true);
-            $raw = is_array($decoded) ? $decoded : [];
-        }
+        $raw = $this->raw($company);
         $out = [];
         foreach ($this->defaultProviders() as $key => $def) {
             $cfg = array_merge($def, is_array($raw[$key] ?? null) ? $raw[$key] : []);
