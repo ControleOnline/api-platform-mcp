@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ControleOnline\Service;
 
+use ControleOnline\Entity\File;
 use ControleOnline\Entity\Integration;
 use ControleOnline\Entity\People;
 use ControleOnline\Entity\Status;
@@ -61,19 +62,27 @@ class McpChatService
     public function chat(array $input): array
     {
         $message = trim((string) ($input['message'] ?? ''));
-        if ($message === '') {
-            throw new \InvalidArgumentException('message is required');
-        }
         $user = $this->currentPeople();
         // /ai belongs to the company's employees and uses that company's AI; outsiders get a 400.
         $company = $this->resolveCompany(isset($input['company_id']) ? (int) $input['company_id'] : null);
+        $file = $this->attachment($input['file_id'] ?? null, $user, $company);
+        if ($message === '' && $file !== null) {
+            // The model only reads text: it learns that something was attached.
+            $message = '📎 ' . $file->getFileName();
+        }
+        if ($message === '') {
+            throw new \InvalidArgumentException('message is required');
+        }
         $taskId = isset($input['task_id']) ? (int) $input['task_id'] : 0;
 
         // A ticket the user opened with the platform, or a company without its own AI: ticket mode.
         $ticket = $taskId ? $this->tickets->findOwn($taskId, $user) : null;
-        $resolved = $ticket ? null : $this->providers->resolve($company, $input['provider'] ?? null);
+        // The requests screen (app-community#1592) always opens human requests: relationship or support.
+        // The internal AI chat stays only for callers that send no type (API compatibility).
+        $requestType = in_array($input['type'] ?? null, McpChatTickets::TYPES, true) ? (string) $input['type'] : null;
+        $resolved = $ticket || $requestType ? null : $this->providers->resolve($company, $input['provider'] ?? null);
         if ($ticket || $resolved === null) {
-            return $this->ticketMessage($ticket, $user, $company, (string) ($input['type'] ?? 'support'), $message);
+            return $this->ticketMessage($ticket, $user, $company, (string) ($input['type'] ?? 'support'), $message, $file);
         }
         [$provider, $config] = $resolved;
 
@@ -84,6 +93,7 @@ class McpChatService
         $visibility = 'private';
 
         $interaction = $this->addInteraction($task, $user, $message, $visibility, 'pending');
+        $interaction->setFile($file);
         $this->em->flush();
         $integrationId = $this->enqueue($task, $company, $channel, 'customer', $interaction->getId(), $provider);
 
@@ -105,12 +115,13 @@ class McpChatService
      *
      * @return array<string, mixed>
      */
-    private function ticketMessage(?Task $ticket, People $user, People $company, string $type, string $message): array
+    private function ticketMessage(?Task $ticket, People $user, People $company, string $type, string $message, ?File $file = null): array
     {
         $ticket ??= $this->tickets->open($user, $company, $type, $message);
         $platform = $ticket->getProvider();
         $withAi = (bool) $ticket->getAiAgent();
         $interaction = $this->addInteraction($ticket, $user, $message, 'public', $withAi ? 'pending' : 'done');
+        $interaction->setFile($file);
         if (method_exists($ticket, 'setAlterDate')) {
             $ticket->setAlterDate(new \DateTime('now'));
         }
@@ -406,6 +417,21 @@ class McpChatService
         );
 
         return array_reverse($rows);
+    }
+
+    /** A file uploaded through /files/upload that belongs to the user or to the company. */
+    private function attachment(mixed $fileId, People $user, People $company): ?File
+    {
+        if (!is_numeric($fileId) || (int) $fileId < 1) {
+            return null;
+        }
+        $file = $this->em->getRepository(File::class)->find((int) $fileId);
+        $owner = $file?->getPeople()?->getId();
+        if (!$file instanceof File || !in_array($owner, [$user->getId(), $company->getId()], true)) {
+            throw new \InvalidArgumentException('file not found');
+        }
+
+        return $file;
     }
 
     /** Reconnects when the server dropped an idle connection (DBAL reconnects lazily after close()). */
