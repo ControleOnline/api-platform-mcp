@@ -22,6 +22,8 @@ class McpChatTickets
     public const TYPES = ['relationship', 'support'];
     /** Ticket opened from /ai: the client follows it there, no WhatsApp/e-mail destination is added. */
     public const VIA_AI = 'via:ai';
+    /** Opened by the customer in the app's requests screen (no WhatsApp/e-mail destination needed). */
+    public const VIA_APP = 'via:app';
 
     public function __construct(
         private readonly EntityManagerInterface $em,
@@ -78,9 +80,6 @@ class McpChatTickets
     {
         $type = in_array($type, self::TYPES, true) ? $type : 'support';
         $platform = $this->platform();
-        if ((int) $platform->getId() === (int) $company->getId()) {
-            throw new \InvalidArgumentException('Configure a IA da empresa em Configurador → IA.');
-        }
 
         $task = new Task();
         $task->setType($type);
@@ -89,7 +88,9 @@ class McpChatTickets
         $task->setClient($user);
         $task->setProvider($platform);
         $task->setTaskStatus($this->statusService->discoveryStatus('open', 'open', $type));
-        $task->setAnnounce([self::VIA_AI]);
+        // Born without a responsible person and without AI: the distribution engine
+        // (api-platform-tasks TicketRulesService) picks the responsible; an analyst may call an AI later.
+        $task->setAnnounce([self::VIA_APP]);
         $this->em->persist($task);
         $this->em->flush();
 
@@ -140,7 +141,7 @@ class McpChatTickets
         $announce = $task->getAnnounce(true);
         $hasContact = array_is_list($announce) && array_filter($announce, static fn ($v) => is_string($v)
             && (preg_match('/^\d{10,15}$/', $v) || filter_var($v, FILTER_VALIDATE_EMAIL)));
-        if ($hasContact || !$task->getClient() || (array_is_list($announce) && in_array(self::VIA_AI, $announce, true))) {
+        if ($hasContact || !$task->getClient() || (array_is_list($announce) && array_intersect([self::VIA_AI, self::VIA_APP], $announce) !== [])) {
             return;
         }
         foreach ($task->getClient()->getPhone() as $phone) {
