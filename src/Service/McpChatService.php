@@ -68,7 +68,8 @@ class McpChatService
         $file = $this->attachment($input['file_id'] ?? null, $user, $company);
         if ($message === '' && $file !== null) {
             // The model only reads text: it learns that something was attached.
-            $message = '📎 ' . $file->getFileName();
+            // Plain text: task_interations.body is not utf8mb4 (no emoji).
+            $message = 'Anexo: ' . $file->getFileName();
         }
         if ($message === '') {
             throw new \InvalidArgumentException('message is required');
