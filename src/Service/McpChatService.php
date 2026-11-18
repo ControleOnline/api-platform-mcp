@@ -83,7 +83,21 @@ class McpChatService
         $requestType = in_array($input['type'] ?? null, McpChatTickets::TYPES, true) ? (string) $input['type'] : null;
         $resolved = $ticket || $requestType ? null : $this->providers->resolve($company, $input['provider'] ?? null);
         if ($ticket || $resolved === null) {
-            return $this->ticketMessage($ticket, $user, $company, (string) ($input['type'] ?? 'support'), $message, $file);
+            // Opening the request and saving its first message are one unit: a refused message must not
+            // leave an empty request behind.
+            $connection = $this->em->getConnection();
+            $connection->beginTransaction();
+            try {
+                $result = $this->ticketMessage($ticket, $user, $company, (string) ($input['type'] ?? 'support'), $message, $file);
+                $connection->commit();
+
+                return $result;
+            } catch (\Throwable $e) {
+                if ($connection->isTransactionActive()) {
+                    $connection->rollBack();
+                }
+                throw $e;
+            }
         }
         [$provider, $config] = $resolved;
 
