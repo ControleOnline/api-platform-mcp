@@ -49,7 +49,37 @@ class McpChatService
         private readonly ?TokenStorageInterface $tokenStorage = null,
         private readonly ?RequestStack $requestStack = null,
         private readonly ?LoggerInterface $logger = null,
+        private readonly ?\ControleOnline\Service\TicketAttendanceService $attendance = null,
     ) {
+    }
+
+    /**
+     * Requests (support / relationship) are answered by the AI person of that kind of request (a named
+     * employee of the company with a bot user), so the conversation shows who spoke. Other chats: the company.
+     */
+    private function aiAuthor(Task $task, People $company): People
+    {
+        $provider = $task->getProvider();
+        if ($this->attendance && $provider instanceof People && in_array($task->getType(), ['support', 'relationship'], true)) {
+            return $this->attendance->aiPeople($provider, (string) $task->getType());
+        }
+
+        return $company;
+    }
+
+    /** The welcome message of the kind of request, once, before the AI's first answer. */
+    private function welcome(Task $task, People $author): void
+    {
+        $provider = $task->getProvider();
+        $text = $provider instanceof People && $this->attendance ? $this->attendance->welcome($provider, (string) $task->getType()) : null;
+        if ($text === null || $author === $provider) {
+            return;
+        }
+        $already = $this->em->getRepository(TaskInteration::class)->count(['task' => $task, 'registeredBy' => $author]);
+        if ($already === 0) {
+            $this->addInteraction($task, $author, $text, 'public', 'done');
+            $this->em->flush();
+        }
     }
 
     /**
@@ -232,6 +262,10 @@ class McpChatService
         }
 
         $toolsUsed = [];
+        // The AI speaks as the AI person of this kind of request (e.g. "Tião IA").
+        $nameHint = $channel === McpChatToolbox::CHANNEL_CUSTOMER
+            ? "\nSeu nome neste atendimento é " . $this->aiAuthor($task, $company)->getName() . '.'
+            : '';
         $this->setStatus($userInteraction, 'processing');
         $this->notify($company, $task, $device, ['status' => 'processing', 'user_interaction_id' => $interactionId]);
 
@@ -247,7 +281,7 @@ class McpChatService
                     $answer = $this->asUser($channel === McpChatToolbox::CHANNEL_WEB ? $asUser : null, fn () => $this->llm->run(
                         $provider,
                         $config,
-                        $this->prompts->system($channel, (string) ($data['trigger'] ?? 'customer'), $company, $task, (string) ($config['system_prompt'] ?? '')),
+                        $this->prompts->system($channel, (string) ($data['trigger'] ?? 'customer'), $company, $task, trim((string) ($config['system_prompt'] ?? '') . $nameHint)),
                         $this->prompts->history($this->recentInteractions($task), $company, $task, $channel),
                         $this->toolbox->definitions($channel, $task),
                         $this->keepingConnection($this->toolbox->executor($channel, $task, $company), $toolsUsed),
@@ -268,7 +302,11 @@ class McpChatService
             // Customer conversations: public, so notifyClient delivers it through the ticket's connection.
             // Customer conversations and /ai chats escalated to a ticket during this run are public.
             $visibility = $channel === McpChatToolbox::CHANNEL_CUSTOMER || !$this->isInternalChat($task) ? 'public' : 'private';
-            $assistant = $this->addInteraction($task, $company, $answer, $visibility, 'done');
+            $author = $channel === McpChatToolbox::CHANNEL_CUSTOMER ? $this->aiAuthor($task, $company) : $company;
+            if ($channel === McpChatToolbox::CHANNEL_CUSTOMER) {
+                $this->welcome($task, $author);
+            }
+            $assistant = $this->addInteraction($task, $author, $answer, $visibility, 'done');
             $this->setStatus($userInteraction, 'done', flush: false);
             if (method_exists($task, 'setAlterDate')) {
                 $task->setAlterDate(new \DateTime('now'));

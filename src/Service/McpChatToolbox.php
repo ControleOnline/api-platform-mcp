@@ -34,6 +34,7 @@ class McpChatToolbox
         private readonly McpServerService $mcpServer,
         private readonly StatusService $statusService,
         private readonly ?McpChatTickets $tickets = null,
+        private readonly ?\ControleOnline\Service\TicketRulesService $ticketRules = null,
     ) {
     }
 
@@ -108,6 +109,13 @@ class McpChatToolbox
         }
         if (method_exists($task, 'setAiAgent')) {
             $task->setAiAgent(null);
+        }
+        // AI first: the request had no responsible person while the AI attended; now the rule picks one.
+        if (!$task->getTaskFor() && $this->ticketRules) {
+            $responsible = $this->ticketRules->pickResponsible($task);
+            if ($responsible) {
+                $task->setTaskFor($responsible);
+            }
         }
         $this->touch($task);
         $label = $type === 'support' ? 'Suporte' : 'Comercial';
