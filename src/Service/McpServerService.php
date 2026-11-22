@@ -153,6 +153,9 @@ class McpServerService
                 ...($this->businessTools?->canMercadoLivre()
                     ? McpBusinessTools::mercadoLivreDefinitions(!$this->isReadOnly())
                     : []),
+                ...($this->businessTools?->canMarketing()
+                    ? McpBusinessTools::marketingDefinitions(!$this->isReadOnly())
+                    : []),
                 [
                     'name' => 'list_capabilities',
                     'description' => 'Lists current MCP capabilities and write policy.',
