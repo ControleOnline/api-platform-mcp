@@ -38,4 +38,7 @@ interface McpMarketingProviderInterface
 
     /** @return array<string, mixed> */
     public function adsenseReport(int $companyId, array $filters): array;
+
+    /** @return array<string, mixed> */
+    public function searchConsoleReport(int $companyId, array $filters): array;
 }
