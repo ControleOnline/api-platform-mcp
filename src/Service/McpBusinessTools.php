@@ -7,6 +7,7 @@ namespace ControleOnline\Service;
 final class McpBusinessTools
 {
     use McpLinkedInTools;
+    use McpMarketingTools;
     private const DATASETS = [
         'sales', 'orders', 'invoices', 'products', 'inventory', 'wallets',
         'employees', 'clients', 'suppliers', 'salespeople', 'commissions',
@@ -18,6 +19,7 @@ final class McpBusinessTools
         private readonly ?McpWriteOperationProviderInterface $writeProvider = null,
         private readonly ?McpLinkedInProviderInterface $linkedInProvider = null,
         private readonly ?McpMercadoLivreProviderInterface $mercadoLivreProvider = null,
+        private readonly ?McpMarketingProviderInterface $marketingProvider = null,
     ) {
     }
 
@@ -185,6 +187,19 @@ final class McpBusinessTools
             'mercadolivre_search_orders' => $this->mercadoLivreSearchOrders($arguments),
             'mercadolivre_import_orders' => $this->mercadoLivreImportOrders($arguments),
             'mercadolivre_import_products' => $this->mercadoLivreImportProducts($arguments),
+            'marketing_connect_status' => $this->marketing()->connectStatus($this->marketingCompanyId($arguments)),
+            'marketing_ga4_report' => $this->marketing()->ga4Report($this->marketingCompanyId($arguments), $this->marketingReportArgs($arguments)),
+            'marketing_ads_campaigns' => $this->marketing()->adsCampaigns($this->marketingCompanyId($arguments)),
+            'marketing_ads_report' => $this->marketing()->adsReport($this->marketingCompanyId($arguments), $this->marketingReportArgs($arguments)),
+            'marketing_adsense_report' => $this->marketing()->adsenseReport($this->marketingCompanyId($arguments), $this->marketingReportArgs($arguments)),
+            'marketing_ads_pause' => $this->marketing()->adsPause($this->marketingCompanyId($arguments), $this->marketingCampaignId($arguments)),
+            'marketing_ads_resume' => $this->marketing()->adsResume($this->marketingCompanyId($arguments), $this->marketingCampaignId($arguments)),
+            'marketing_ads_update_budget' => $this->marketing()->adsUpdateBudget(
+                $this->marketingCompanyId($arguments),
+                $this->marketingCampaignId($arguments),
+                $this->marketingAmountMicros($arguments),
+                (bool) ($arguments['force'] ?? false),
+            ),
             default => throw new \InvalidArgumentException('Unknown business data tool'),
         };
     }
