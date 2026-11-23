@@ -24,7 +24,9 @@ class McpChatToolbox
     public const CHANNEL_CUSTOMER = 'customer';
     public const HANDOFF_TYPES = ['relationship', 'support'];
 
-    /** Mutating MCP tools are never offered to the chat. */
+    /** Mutating MCP tools are never offered to the chat. Marketing mutations are
+     *  the exception: they are surfaced here because the MKT chat is the whole
+     *  point of #100 — the UI enforces confirmation before sending force=true. */
     private const BLOCKED_TOOLS = [
         'write_business_data', 'linkedin_create_post', 'linkedin_create_organization_post', 'mercadolivre_import_products',
     ];
