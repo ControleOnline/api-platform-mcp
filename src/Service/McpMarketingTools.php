@@ -60,6 +60,13 @@ trait McpMarketingTools
                     'metrics' => ['type' => 'array', 'items' => ['type' => 'string']],
                 ], 'required' => ['company_id'], 'additionalProperties' => false],
             ],
+            [
+                'name' => 'marketing_search_console_report',
+                'description' => 'Clicks, impressões, CTR e posição média orgânica (Search Console) por período e dimensão (query, page, device, country).',
+                'inputSchema' => ['type' => 'object', 'properties' => $company + $period + [
+                    'dimensions' => ['type' => 'array', 'items' => ['type' => 'string']],
+                ], 'required' => ['company_id'], 'additionalProperties' => false],
+            ],
         ];
 
         if ($includeMutations) {

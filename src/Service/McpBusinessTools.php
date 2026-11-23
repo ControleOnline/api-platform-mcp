@@ -192,6 +192,7 @@ final class McpBusinessTools
             'marketing_ads_campaigns' => $this->marketing()->adsCampaigns($this->marketingCompanyId($arguments)),
             'marketing_ads_report' => $this->marketing()->adsReport($this->marketingCompanyId($arguments), $this->marketingReportArgs($arguments)),
             'marketing_adsense_report' => $this->marketing()->adsenseReport($this->marketingCompanyId($arguments), $this->marketingReportArgs($arguments)),
+            'marketing_search_console_report' => $this->marketing()->searchConsoleReport($this->marketingCompanyId($arguments), $this->marketingReportArgs($arguments)),
             'marketing_ads_pause' => $this->marketing()->adsPause($this->marketingCompanyId($arguments), $this->marketingCampaignId($arguments)),
             'marketing_ads_resume' => $this->marketing()->adsResume($this->marketingCompanyId($arguments), $this->marketingCampaignId($arguments)),
             'marketing_ads_update_budget' => $this->marketing()->adsUpdateBudget(
