@@ -2,11 +2,19 @@
   "version": "1.0.39",
   "rc": 1,
   "branch": "rc/1.0.39-rc.1",
-  "baseMaster": "9ca22738b8cbd9ab44fee7e432c928dcc9277eeb",
+  "baseMaster": "457f4a1816ba043ebae2bc90f1aa78fa56362477",
   "baseTag": "v1.0.38",
-  "tasks": [105, 107],
+  "tasks": [
+    1761
+  ],
+  "taskRepository": "ControleOnline/app-community",
   "frozen": true,
   "repositories": {
-    "ControleOnline/api-platform-mcp": "6af945cc8712c44ea6866f11b49fc7c33cb3b9e3"
+    "ControleOnline/api-platform-mcp": "ffd5b19b7f1ca61e6df692511ee43d1eab684004"
+  },
+  "sources": {
+    "versão de produção v1.0.37": "2c4b7091acc6cea6d18a6549e4d139914c5a3a23",
+    "staging": "7c18a954fc95bdbd31ddfe42d0514cda6a85eb80",
+    "dev": "c9201c76343e978a8d940650b7fe0668ff80f523"
   }
 }
